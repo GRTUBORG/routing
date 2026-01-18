@@ -35,4 +35,4 @@ Routing for AWG \ VLESS
 Подключитесь к вашему VPS серверу в РФ (Ubuntu/Debian) и выполните одну команду, далее просто следуйте инструкциям:
 
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/GRTUBORG/routing/refs/heads/master/install.sh && chmod +x install.sh && ./install.sh
+wget -O routing.sh https://raw.githubusercontent.com/GRTUBORG/routing/refs/heads/master/routing.sh && chmod +x routing.sh && ./routing.sh
