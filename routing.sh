@@ -57,12 +57,12 @@ prepare_system() {
 
 # --- ПРОМО БЛОК ---
 show_promo() {
-    local PROMO_LINK="https://vk.cc/cQAnaG"
+    local PROMO_LINK="https://vk.cc/cUnikK"
 
     clear
     echo ""
     echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${MAGENTA}║                 VPN, КОТОРЫЙ РАБОТАЕТ ВЕЗДЕ                  ║${NC}"
+    echo -e "${MAGENTA}║                ЛУЧШИЙ РУ-ХОСТИНГ ПОД ВАШИ НУЖДЫ              ║${NC}"
     echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
