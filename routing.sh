@@ -9,6 +9,7 @@ MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+PROMO_MARKER_FILE='/var/lib/routing/.promo_shown'
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -90,6 +91,18 @@ show_promo() {
     echo -e "${GREEN}Отсканируйте QR-код выше камерой телефона!${NC}"
     echo ""
     read -p "Нажмите Enter для настройки роутинга пакетов..."
+}
+
+show_promo_once() {
+    if [[ -f "$PROMO_MARKER_FILE" ]]; then
+        return
+    fi
+
+    mkdir -p "$(dirname "$PROMO_MARKER_FILE")"
+
+    if show_promo; then
+        touch "$PROMO_MARKER_FILE"
+    fi
 }
 
 # --- ИНСТРУКЦИЯ (ТЕКСТ ВНУТРИ КОДА) ---
@@ -286,5 +299,5 @@ show_menu() {
 # --- ЗАПУСК ---
 check_root
 prepare_system
-show_promo
+show_promo_once
 show_menu
