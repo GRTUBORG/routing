@@ -1,4 +1,3 @@
-# routung
 Routing for AWG \ VLESS
 # 🌊 Route Traffic Manager
 
