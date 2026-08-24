@@ -218,7 +218,9 @@ list_active_rules() {
         l_comment=$(echo "$line" | sed -n 's/.*--comment "\(routing:[^"]*\)".*/\1/p')
         l_name="${l_comment#routing:}"
         if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
-        if [[ -n "$l_port" ]]; then echo -e "$l_name\t\t$l_port\t\t$l_proto\t\t$l_dest"; fi
+        if [[ -n "$l_port" ]]; then printf '%s|%s|%s|%s\n' "$l_port" "$l_name" "$l_proto" "$l_dest"; fi
+    done | sort -t'|' -k1,1n | while IFS='|' read -r l_port l_name l_proto l_dest; do
+        echo -e "$l_name\t\t$l_port\t\t$l_proto\t\t$l_dest"
     done
     echo ""
     read -p "Нажмите Enter..."
