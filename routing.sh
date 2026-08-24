@@ -210,25 +210,43 @@ configure_rule() {
 # --- РАБОТА С НАИМЕНОВАНИЯМИ ПРАВИЛ ---
 extract_rule_comment() {
     local line="$1"
-    local comment
+    local quoted_regex='--comment[[:space:]]+"(routing:[^"]*)"'
+    local plain_regex='--comment[[:space:]]+(routing:[^[:space:]]+)'
 
-    # В зависимости от версии iptables комментарий может выводиться в кавычках или без них.
-    comment=$(echo "$line" | sed -n 's/.*--comment "\(routing:[^"]*\)".*/\1/p')
-    if [[ -z "$comment" ]]; then
-        comment=$(echo "$line" | grep -oP '(?<=--comment )routing:[^[:space:]]+' | head -n 1)
+    if [[ "$line" =~ $quoted_regex ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ $plain_regex ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
     fi
+}
 
-    printf '%s' "$comment"
+extract_rule_port() {
+    local line="$1"
+    local regex='--dport[[:space:]]+([0-9]+)'
+    if [[ "$line" =~ $regex ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
+}
+
+extract_rule_proto() {
+    local line="$1"
+    local regex='(^|[[:space:]])-p[[:space:]]+([[:alnum:]_]+)'
+    if [[ "$line" =~ $regex ]]; then printf '%s' "${BASH_REMATCH[2]}"; fi
+}
+
+extract_rule_destination() {
+    local line="$1"
+    local regex='--to-destination[[:space:]]+([0-9.:]+)'
+    if [[ "$line" =~ $regex ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
 }
 
 # --- СПИСОК ПРАВИЛ ---
 list_active_rules() {
     echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
     echo -e "${MAGENTA}НАИМЕНОВАНИЕ\tВХОДЯЩИЙ ПОРТ\tПРОТОКОЛ\tЦЕЛЬ${NC}"
-    iptables -t nat -S PREROUTING | grep "DNAT" | while read -r line ; do
-        l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
-        l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
-        l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
+    iptables -t nat -S PREROUTING | while read -r line ; do
+        [[ "$line" == *"-j DNAT"* ]] || continue
+        l_port=$(extract_rule_port "$line")
+        l_proto=$(extract_rule_proto "$line")
+        l_dest=$(extract_rule_destination "$line")
         l_comment=$(extract_rule_comment "$line")
         l_name="${l_comment#routing:}"
         if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
@@ -246,9 +264,10 @@ delete_single_rule() {
     declare -a RULES_LIST
     local i=1
     while read -r line; do
-        l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
-        l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
-        l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
+        [[ "$line" == *"-j DNAT"* ]] || continue
+        l_port=$(extract_rule_port "$line")
+        l_proto=$(extract_rule_proto "$line")
+        l_dest=$(extract_rule_destination "$line")
         l_comment=$(extract_rule_comment "$line")
         l_name="${l_comment#routing:}"
         if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
@@ -257,7 +276,7 @@ delete_single_rule() {
             echo -e "${YELLOW}[$i]${NC} $l_name: входящий порт $l_port ($l_proto) -> $l_dest"
             ((i++))
         fi
-    done < <(iptables -t nat -S PREROUTING | grep "DNAT")
+    done < <(iptables -t nat -S PREROUTING)
 
     if [ ${#RULES_LIST[@]} -eq 0 ]; then
         echo -e "${RED}Нет активных правил.${NC}"
@@ -309,9 +328,9 @@ rename_rule() {
             fi
 
             [[ "$line" == *"-j DNAT"* ]] || continue
-            r_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
-            r_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
-            r_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
+            r_port=$(extract_rule_port "$line")
+            r_proto=$(extract_rule_proto "$line")
+            r_dest=$(extract_rule_destination "$line")
             r_comment=$(extract_rule_comment "$line")
             if [[ -n "$r_port" && -n "$r_proto" && -n "$r_dest" ]]; then
                 printf '%s|%s|%s|%s|%s\n' "$r_port" "$rule_index" "$r_proto" "$r_dest" "$r_comment"
