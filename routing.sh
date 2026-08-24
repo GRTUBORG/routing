@@ -119,14 +119,14 @@ show_instructions() {
     echo ""
     echo -e "${CYAN}ШАГ 2: Настройка данного сервера${NC}"
     echo -e "1. В меню выберите пункт ${GREEN}1${NC} (для UDP-трафика/VPN) или ${GREEN}2${NC} (для TCP-трафика/Proxy)."
-    echo -e "2. Введите ${YELLOW}IP${NC} и ${YELLOW}Порт${NC} зарубежного сервера."
+    echo -e "2. Введите ${YELLOW}IP${NC}, ${YELLOW}входящий порт${NC} этого сервера и ${YELLOW}исходящий порт${NC} зарубежного сервера."
     echo -e "3. Скрипт создаст 'мост' через этот VPS."
     echo ""
     echo -e "${CYAN}ШАГ 3: Настройка клиентского приложения (Важно!)${NC}"
     echo -e "1. Откройте приложение (AmneziaWG / WireGuard / v2rayNG)."
     echo -e "2. В настройках соединения найдите поле ${YELLOW}Endpoint / Адрес сервера${NC}."
     echo -e "3. Замените зарубежный IP на ${GREEN}IP ЭТОГО СЕРВЕРА${NC}."
-    echo -e "4. Порт оставьте прежним."
+    echo -e "4. В качестве порта укажите входящий порт, заданный в скрипте."
     echo ""
     echo -e "${GREEN}Готово! Теперь трафик идет по следующей схеме: клиент -> этот сервер -> зарубежный сервер.${NC}"
     echo ""
@@ -147,10 +147,17 @@ configure_rule() {
     done
 
     while true; do
-        echo -e "Введите порт (входной и выходной):"
-        read -p "> " PORT
-        if [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -le 65535 ]; then break; fi
-        echo -e "${RED}Ошибка: порт должен быть числом и должен быть меньше числа 65536!${NC}"
+        echo -e "Введите входящий порт (порт этого сервера):"
+        read -p "> " IN_PORT
+        if [[ "$IN_PORT" =~ ^[0-9]+$ ]] && [ "$IN_PORT" -ge 1 ] && [ "$IN_PORT" -le 65535 ]; then break; fi
+        echo -e "${RED}Ошибка: порт должен быть числом от 1 до 65535!${NC}"
+    done
+
+    while true; do
+        echo -e "Введите исходящий порт (порт конечного сервера):"
+        read -p "> " OUT_PORT
+        if [[ "$OUT_PORT" =~ ^[0-9]+$ ]] && [ "$OUT_PORT" -ge 1 ] && [ "$OUT_PORT" -le 65535 ]; then break; fi
+        echo -e "${RED}Ошибка: порт должен быть числом от 1 до 65535!${NC}"
     done
 
     IFACE=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
@@ -161,23 +168,23 @@ configure_rule() {
 
     echo -e "${YELLOW}[*] Применение правил...${NC}"
 
-    iptables -t nat -D PREROUTING -p $PROTO --dport "$PORT" -j DNAT --to-destination "$TARGET_IP:$PORT" 2>/dev/null
-    iptables -D INPUT -p $PROTO --dport "$PORT" -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p $PROTO -d "$TARGET_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p $PROTO -s "$TARGET_IP" --sport "$PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
+    iptables -D INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
 
-    iptables -A INPUT -p $PROTO --dport "$PORT" -j ACCEPT
-    iptables -t nat -A PREROUTING -p $PROTO --dport "$PORT" -j DNAT --to-destination "$TARGET_IP:$PORT"
+    iptables -A INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT
+    iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"
     
     if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
         iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
     fi
 
-    iptables -A FORWARD -p $PROTO -d "$TARGET_IP" --dport "$PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
-    iptables -A FORWARD -p $PROTO -s "$TARGET_IP" --sport "$PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT
+    iptables -A FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+    iptables -A FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT
 
     if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$PORT"/$PROTO >/dev/null
+        ufw allow "$IN_PORT"/"$PROTO" >/dev/null
         sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
         ufw reload >/dev/null
     fi
@@ -185,19 +192,19 @@ configure_rule() {
     netfilter-persistent save > /dev/null
     
     echo -e "${GREEN}[SUCCESS] Туннель успешно настроен!${NC}"
-    echo -e "$PROTO: Порт $PORT -> $TARGET_IP:$PORT"
+    echo -e "$PROTO: Порт $IN_PORT -> $TARGET_IP:$OUT_PORT"
     read -p "Нажмите Enter для возврата в меню..."
 }
 
 # --- СПИСОК ПРАВИЛ ---
 list_active_rules() {
     echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
-    echo -e "${MAGENTA}ПОРТ\tПРОТОКОЛ\tЦЕЛЬ${NC}"
+    echo -e "${MAGENTA}ВХОДЯЩИЙ ПОРТ\tПРОТОКОЛ\tЦЕЛЬ${NC}"
     iptables -t nat -S PREROUTING | grep "DNAT" | while read -r line ; do
         l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
         l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        if [[ -n "$l_port" ]]; then echo -e "$l_port\t$l_proto\t\t$l_dest"; fi
+        if [[ -n "$l_port" ]]; then echo -e "$l_port\t\t$l_proto\t\t$l_dest"; fi
     done
     echo ""
     read -p "Нажмите Enter..."
@@ -213,8 +220,8 @@ delete_single_rule() {
         l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
         if [[ -n "$l_port" ]]; then
-            RULES_LIST[$i]="$l_port:$l_proto:$l_dest"
-            echo -e "${YELLOW}[$i]${NC} Порт: $l_port ($l_proto) -> $l_dest"
+            RULES_LIST[$i]="$l_port|$l_proto|$l_dest"
+            echo -e "${YELLOW}[$i]${NC} Входящий порт: $l_port ($l_proto) -> $l_dest"
             ((i++))
         fi
     done < <(iptables -t nat -S PREROUTING | grep "DNAT")
@@ -229,12 +236,14 @@ delete_single_rule() {
     read -p "Номер правила для удаления (или введите число 0 для отмены): " rule_num
     if [[ "$rule_num" == "0" || -z "${RULES_LIST[$rule_num]}" ]]; then return; fi
 
-    IFS=':' read -r d_port d_proto d_dest <<< "${RULES_LIST[$rule_num]}"
+    IFS='|' read -r d_port d_proto d_dest <<< "${RULES_LIST[$rule_num]}"
+    d_target_ip="${d_dest%:*}"
+    d_target_port="${d_dest##*:}"
     
     iptables -t nat -D PREROUTING -p "$d_proto" --dport "$d_port" -j DNAT --to-destination "$d_dest" 2>/dev/null
     iptables -D INPUT -p "$d_proto" --dport "$d_port" -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$d_proto" -d "${d_dest%:*}" --dport "$d_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$d_proto" -s "${d_dest%:*}" --sport "$d_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -p "$d_proto" -d "$d_target_ip" --dport "$d_target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -p "$d_proto" -s "$d_target_ip" --sport "$d_target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
     
     netfilter-persistent save > /dev/null
     echo -e "${GREEN}[OK] Удалено.${NC}"
