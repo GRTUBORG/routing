@@ -238,21 +238,64 @@ extract_rule_destination() {
     if [[ "$line" =~ $regex ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
 }
 
+print_rule_table_row() {
+    local name="$1"
+    local port="$2"
+    local proto="$3"
+    local destination="$4"
+    local name_width="$5"
+    local port_width="$6"
+    local proto_width="$7"
+    local gap=3
+
+    printf '%s%*s%s%*s%s%*s%s\n' \
+        "$name" "$((name_width - ${#name} + gap))" "" \
+        "$port" "$((port_width - ${#port} + gap))" "" \
+        "$proto" "$((proto_width - ${#proto} + gap))" "" \
+        "$destination"
+}
+
 # --- СПИСОК ПРАВИЛ ---
 list_active_rules() {
     echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
-    echo -e "${MAGENTA}НАИМЕНОВАНИЕ\tВХОДЯЩИЙ ПОРТ\tПРОТОКОЛ\tЦЕЛЬ${NC}"
-    iptables -t nat -S PREROUTING | while read -r line ; do
-        [[ "$line" == *"-j DNAT"* ]] || continue
-        l_port=$(extract_rule_port "$line")
-        l_proto=$(extract_rule_proto "$line")
-        l_dest=$(extract_rule_destination "$line")
-        l_comment=$(extract_rule_comment "$line")
-        l_name="${l_comment#routing:}"
-        if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
-        if [[ -n "$l_port" ]]; then printf '%s|%s|%s|%s\n' "$l_port" "$l_name" "$l_proto" "$l_dest"; fi
-    done | sort -t'|' -k1,1n | while IFS='|' read -r l_port l_name l_proto l_dest; do
-        echo -e "$l_name\t\t$l_port\t\t$l_proto\t\t$l_dest"
+    declare -a DISPLAY_RULES
+    local NAME_HEADER="НАИМЕНОВАНИЕ"
+    local PORT_HEADER="ВХОДЯЩИЙ ПОРТ"
+    local PROTO_HEADER="ПРОТОКОЛ"
+    local DEST_HEADER="ЦЕЛЬ"
+    local name_width
+    local port_width
+    local proto_width
+
+    name_width=${#NAME_HEADER}
+    port_width=${#PORT_HEADER}
+    proto_width=${#PROTO_HEADER}
+
+    while IFS='|' read -r l_port l_name l_proto l_dest; do
+        DISPLAY_RULES+=("$l_port|$l_name|$l_proto|$l_dest")
+        if [ ${#l_name} -gt "$name_width" ]; then name_width=${#l_name}; fi
+        if [ ${#l_port} -gt "$port_width" ]; then port_width=${#l_port}; fi
+        if [ ${#l_proto} -gt "$proto_width" ]; then proto_width=${#l_proto}; fi
+    done < <(
+        iptables -t nat -S PREROUTING | while read -r line ; do
+            [[ "$line" == *"-j DNAT"* ]] || continue
+            l_port=$(extract_rule_port "$line")
+            l_proto=$(extract_rule_proto "$line")
+            l_dest=$(extract_rule_destination "$line")
+            l_comment=$(extract_rule_comment "$line")
+            l_name="${l_comment#routing:}"
+            if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
+            if [[ -n "$l_port" ]]; then printf '%s|%s|%s|%s\n' "$l_port" "$l_name" "$l_proto" "$l_dest"; fi
+        done | sort -t'|' -k1,1n
+    )
+
+    echo -ne "${MAGENTA}"
+    print_rule_table_row "$NAME_HEADER" "$PORT_HEADER" "$PROTO_HEADER" "$DEST_HEADER" "$name_width" "$port_width" "$proto_width"
+    echo -ne "${NC}"
+
+    for rule in "${DISPLAY_RULES[@]}"; do
+        IFS='|' read -r l_port l_name l_proto l_dest <<< "$rule"
+        print_rule_table_row "$l_name" "$l_port" "$l_proto" "$l_dest" "$name_width" "$port_width" "$proto_width"
     done
     echo ""
     read -p "Нажмите Enter..."
