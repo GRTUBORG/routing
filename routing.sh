@@ -40,6 +40,19 @@ is_valid_utf8() {
     fi
 }
 
+is_valid_ipv4() {
+    local ip="$1"
+    local octets
+    local octet
+
+    IFS='.' read -r -a octets <<< "$ip"
+    [ ${#octets[@]} -eq 4 ] || return 1
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
+}
+
 check_root() {
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}[ERROR] Запустите скрипт с правами root!${NC}"
@@ -499,6 +512,141 @@ list_active_rules() {
     read -p "Нажмите Enter..."
 }
 
+# --- БЫСТРАЯ ЗАМЕНА КОНЕЧНОГО IP ---
+update_target_ip() {
+    echo -e "\n${CYAN}--- Быстрая замена конечного IP ---${NC}"
+    declare -a UPDATE_RULES
+    local i=1
+    local rule_index=0
+
+    while IFS='|' read -r u_port u_index u_proto u_dest u_name; do
+        u_display_name="$u_name"
+        if [[ -z "$u_display_name" ]]; then u_display_name="Без имени"; fi
+        UPDATE_RULES[$i]="$u_index|$u_port|$u_proto|$u_dest|$u_name"
+        echo -e "${YELLOW}[$i]${NC} $u_display_name: входящий порт $u_port ($u_proto) -> $u_dest"
+        ((i++))
+    done < <(
+        while read -r line; do
+            [[ "$line" == "-A PREROUTING "* ]] || continue
+            ((rule_index++))
+            [[ "$line" == *"-j DNAT"* ]] || continue
+
+            u_port=$(extract_rule_port "$line")
+            u_proto=$(extract_rule_proto "$line")
+            u_dest=$(extract_rule_destination "$line")
+            u_name=$(get_rule_name "$u_proto" "$u_port" "$u_dest")
+            if [[ -z "$u_name" ]]; then
+                u_comment=$(extract_rule_comment "$line")
+                u_name="${u_comment#routing:}"
+            fi
+            if [[ -n "$u_name" ]] && ! is_valid_utf8 "$u_name"; then u_name=""; fi
+
+            if [[ -n "$u_port" && -n "$u_proto" && -n "$u_dest" ]]; then
+                printf '%s|%s|%s|%s|%s\n' "$u_port" "$rule_index" "$u_proto" "$u_dest" "$u_name"
+            fi
+        done < <(iptables -t nat -S PREROUTING) |
+            sort -t'|' -k1,1n
+    )
+
+    if [ ${#UPDATE_RULES[@]} -eq 0 ]; then
+        echo -e "${RED}Нет активных правил.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    echo ""
+    read -p "Номер правила (или 0 для отмены): " rule_num
+    if [[ "$rule_num" == "0" || -z "${UPDATE_RULES[$rule_num]}" ]]; then return; fi
+
+    while true; do
+        echo -e "Введите новый конечный IPv4-адрес:"
+        read -r -p "> " new_target_ip
+        if is_valid_ipv4 "$new_target_ip"; then break; fi
+        echo -e "${RED}Ошибка: введите корректный IPv4-адрес.${NC}"
+    done
+
+    IFS='|' read -r u_index u_port u_proto u_dest u_name <<< "${UPDATE_RULES[$rule_num]}"
+    u_old_ip="${u_dest%:*}"
+    u_out_port="${u_dest##*:}"
+    u_new_dest="$new_target_ip:$u_out_port"
+
+    if [[ "$new_target_ip" == "$u_old_ip" ]]; then
+        echo -e "${YELLOW}[INFO] Этот IP уже установлен. Изменения не требуются.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    u_iface=$(ip route get "$new_target_ip" | awk -- '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+    if [[ -z "$u_iface" ]]; then
+        echo -e "${RED}[ERROR] Не удалось определить маршрут до $new_target_ip.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    if ! iptables -t nat -C POSTROUTING -o "$u_iface" -j MASQUERADE 2>/dev/null; then
+        if ! iptables -t nat -A POSTROUTING -o "$u_iface" -j MASQUERADE; then
+            echo -e "${RED}[ERROR] Не удалось создать MASQUERADE на интерфейсе $u_iface.${NC}"
+            read -p "Нажмите Enter..."
+            return
+        fi
+    fi
+
+    if ! iptables -I FORWARD 1 -p "$u_proto" -d "$new_target_ip" --dport "$u_out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT; then
+        echo -e "${RED}[ERROR] Не удалось разрешить трафик к новому IP.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    if ! iptables -I FORWARD 1 -p "$u_proto" -s "$new_target_ip" --sport "$u_out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT; then
+        iptables -D FORWARD -p "$u_proto" -d "$new_target_ip" --dport "$u_out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        echo -e "${RED}[ERROR] Не удалось разрешить обратный трафик от нового IP.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    if ! iptables -t nat -R PREROUTING "$u_index" -p "$u_proto" --dport "$u_port" -j DNAT --to-destination "$u_new_dest"; then
+        iptables -D FORWARD -p "$u_proto" -d "$new_target_ip" --dport "$u_out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -p "$u_proto" -s "$new_target_ip" --sport "$u_out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        echo -e "${RED}[ERROR] Не удалось заменить конечный IP в DNAT.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    if ! iptables -t nat -C PREROUTING -p "$u_proto" --dport "$u_port" -j DNAT --to-destination "$u_new_dest" 2>/dev/null; then
+        iptables -t nat -R PREROUTING "$u_index" -p "$u_proto" --dport "$u_port" -j DNAT --to-destination "$u_dest" 2>/dev/null
+        iptables -D FORWARD -p "$u_proto" -d "$new_target_ip" --dport "$u_out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -p "$u_proto" -s "$new_target_ip" --sport "$u_out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        echo -e "${RED}[ERROR] Проверка нового DNAT не пройдена; старый маршрут восстановлен.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    iptables -D FORWARD -p "$u_proto" -d "$u_old_ip" --dport "$u_out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -p "$u_proto" -s "$u_old_ip" --sport "$u_out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+
+    if [[ -n "$u_name" ]]; then
+        if set_rule_name "$u_proto" "$u_port" "$u_new_dest" "$u_name"; then
+            delete_rule_name "$u_proto" "$u_port" "$u_dest" 2>/dev/null || true
+        else
+            echo -e "${YELLOW}[WARNING] IP изменён, но не удалось перенести наименование.${NC}"
+        fi
+    else
+        delete_rule_name "$u_proto" "$u_port" "$u_dest" 2>/dev/null || true
+    fi
+
+    if command -v conntrack &> /dev/null; then
+        conntrack -D -p "$u_proto" --dport "$u_port" >/dev/null 2>&1 || true
+    fi
+
+    if ! netfilter-persistent save > /dev/null; then
+        echo -e "${YELLOW}[WARNING] IP изменён, но не удалось сохранить правила для перезагрузки.${NC}"
+    fi
+
+    echo -e "${GREEN}[OK] Конечный IP изменён: $u_old_ip -> $new_target_ip${NC}"
+    echo -e "$u_proto: порт $u_port -> $u_new_dest"
+    read -p "Нажмите Enter..."
+}
+
 # --- УДАЛЕНИЕ ОДНОГО ПРАВИЛА ---
 delete_single_rule() {
     echo -e "\n${CYAN}--- Удаление правила ---${NC}"
@@ -644,12 +792,13 @@ show_menu() {
                 
         echo -e "1) Настроить ${CYAN}AmneziaWG / WireGuard${NC} (UDP)"
         echo -e "2) Настроить ${CYAN}VLESS / XRay${NC} (TCP)"
-        echo -e "3) Посмотреть активные правила"
-        echo -e "4) ${RED}Удалить одно правило${NC}"
-        echo -e "5) ${RED}Сбросить ВСЕ настройки${NC}"
-        echo -e "6) ${YELLOW}Показать PROMO${NC}"
-        echo -e "7) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
-        echo -e "8) ${CYAN}Присвоить / изменить наименование правила${NC}"
+        echo -e "3) ${YELLOW}Быстро изменить конечный IP${NC}"
+        echo -e "4) Посмотреть активные правила"
+        echo -e "5) ${RED}Удалить одно правило${NC}"
+        echo -e "6) ${RED}Сбросить ВСЕ настройки${NC}"
+        echo -e "7) ${YELLOW}Показать PROMO${NC}"
+        echo -e "8) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
+        echo -e "9) ${CYAN}Присвоить / изменить наименование правила${NC}"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
@@ -657,12 +806,13 @@ show_menu() {
         case $choice in
             1) configure_rule "udp" "AmneziaWG" ;;
             2) configure_rule "tcp" "VLESS" ;;
-            3) list_active_rules ;;
-            4) delete_single_rule ;;
-            5) flush_rules ;;
-            6) show_promo ;;
-            7) show_instructions ;;
-            8) rename_rule ;;
+            3) update_target_ip ;;
+            4) list_active_rules ;;
+            5) delete_single_rule ;;
+            6) flush_rules ;;
+            7) show_promo ;;
+            8) show_instructions ;;
+            9) rename_rule ;;
             0) exit 0 ;;
             *) ;;
         esac
