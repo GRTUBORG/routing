@@ -12,6 +12,13 @@ NC='\033[0m'
 PROMO_MARKER_FILE='/var/lib/routing/.promo_shown'
 NAMES_FILE='/var/lib/routing/names.db'
 
+# Корректная обработка кириллицы и Backspace в интерактивном терминале.
+if LC_ALL=C.UTF-8 locale charmap >/dev/null 2>&1; then
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+fi
+stty iutf8 2>/dev/null || true
+
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 type_text() {
@@ -22,6 +29,15 @@ type_text() {
         sleep $delay
     done
     echo ""
+}
+
+is_valid_utf8() {
+    local text="$1"
+    if command -v iconv >/dev/null 2>&1; then
+        printf '%s' "$text" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1
+    else
+        return 0
+    fi
 }
 
 check_root() {
@@ -200,9 +216,9 @@ configure_rule() {
 
     while true; do
         echo -e "Введите наименование сервера (например, NL-1 или Германия):"
-        read -p "> " SERVER_NAME
-        if [[ -n "$SERVER_NAME" && ${#SERVER_NAME} -le 100 && "$SERVER_NAME" != *'|'* && "$SERVER_NAME" != *'"'* ]]; then break; fi
-        echo -e "${RED}Ошибка: наименование должно содержать от 1 до 100 символов и не может содержать | и \".${NC}"
+        read -r -e -p "> " SERVER_NAME
+        if [[ -n "$SERVER_NAME" && ${#SERVER_NAME} -le 100 && "$SERVER_NAME" != *'|'* && "$SERVER_NAME" != *'"'* ]] && is_valid_utf8 "$SERVER_NAME"; then break; fi
+        echo -e "${RED}Ошибка: используйте корректный UTF-8 текст длиной от 1 до 100 символов без | и \".${NC}"
     done
 
     while true; do
@@ -334,10 +350,13 @@ get_rule_name() {
     local port="$2"
     local destination="$3"
 
+    local name
+
     [[ -f "$NAMES_FILE" ]] || return
-    awk -F'|' -v proto="$proto" -v port="$port" -v destination="$destination" '
+    name=$(awk -F'|' -v proto="$proto" -v port="$port" -v destination="$destination" '
         $1 == proto && $2 == port && $3 == destination { print $4; exit }
-    ' "$NAMES_FILE"
+    ' "$NAMES_FILE")
+    if [[ -n "$name" ]] && is_valid_utf8 "$name"; then printf '%s' "$name"; fi
 }
 
 set_rule_name() {
@@ -347,6 +366,7 @@ set_rule_name() {
     local name="$4"
     local temp_file
 
+    is_valid_utf8 "$name" || return 1
     mkdir -p "$(dirname "$NAMES_FILE")" || return 1
     touch "$NAMES_FILE" || return 1
     temp_file=$(mktemp "${NAMES_FILE}.tmp.XXXXXX") || return 1
@@ -405,7 +425,7 @@ migrate_legacy_names() {
 
         comment=$(extract_rule_comment "$line")
         name="${comment#routing:}"
-        if [[ -n "$name" ]]; then
+        if [[ -n "$name" ]] && is_valid_utf8 "$name"; then
             set_rule_name "$proto" "$port" "$destination" "$name" 2>/dev/null || true
         fi
     done < <(iptables -t nat -S PREROUTING 2>/dev/null)
@@ -461,6 +481,7 @@ list_active_rules() {
                 l_comment=$(extract_rule_comment "$line")
                 l_name="${l_comment#routing:}"
             fi
+            if [[ -n "$l_name" ]] && ! is_valid_utf8 "$l_name"; then l_name=""; fi
             if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
             if [[ -n "$l_port" ]]; then printf '%s|%s|%s|%s\n' "$l_port" "$l_name" "$l_proto" "$l_dest"; fi
         done | sort -t'|' -k1,1n
@@ -491,6 +512,7 @@ delete_single_rule() {
         l_comment=$(extract_rule_comment "$line")
         l_name=$(get_rule_name "$l_proto" "$l_port" "$l_dest")
         if [[ -z "$l_name" ]]; then l_name="${l_comment#routing:}"; fi
+        if [[ -n "$l_name" ]] && ! is_valid_utf8 "$l_name"; then l_name=""; fi
         if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
         if [[ -n "$l_port" ]]; then
             RULES_LIST[$i]="$l_port|$l_proto|$l_dest|$l_comment"
@@ -554,6 +576,7 @@ rename_rule() {
                 r_comment=$(extract_rule_comment "$line")
                 r_name="${r_comment#routing:}"
             fi
+            if [[ -n "$r_name" ]] && ! is_valid_utf8 "$r_name"; then r_name=""; fi
             if [[ -z "$r_name" ]]; then r_name="Без имени"; fi
             if [[ -n "$r_port" && -n "$r_proto" && -n "$r_dest" ]]; then
                 printf '%s|%s|%s|%s\n' "$r_port" "$r_proto" "$r_dest" "$r_name"
@@ -574,9 +597,9 @@ rename_rule() {
 
     while true; do
         echo -e "Введите новое наименование сервера:"
-        read -p "> " new_name
-        if [[ -n "$new_name" && ${#new_name} -le 100 && "$new_name" != *'|'* && "$new_name" != *'"'* ]]; then break; fi
-        echo -e "${RED}Ошибка: наименование должно содержать от 1 до 100 символов и не может содержать | и \".${NC}"
+        read -r -e -p "> " new_name
+        if [[ -n "$new_name" && ${#new_name} -le 100 && "$new_name" != *'|'* && "$new_name" != *'"'* ]] && is_valid_utf8 "$new_name"; then break; fi
+        echo -e "${RED}Ошибка: используйте корректный UTF-8 текст длиной от 1 до 100 символов без | и \".${NC}"
     done
 
     IFS='|' read -r r_port r_proto r_dest <<< "${RENAME_RULES[$rule_num]}"
