@@ -119,7 +119,7 @@ show_instructions() {
     echo ""
     echo -e "${CYAN}ШАГ 2: Настройка данного сервера${NC}"
     echo -e "1. В меню выберите пункт ${GREEN}1${NC} (для UDP-трафика/VPN) или ${GREEN}2${NC} (для TCP-трафика/Proxy)."
-    echo -e "2. Введите ${YELLOW}IP${NC}, ${YELLOW}входящий порт${NC} этого сервера и ${YELLOW}исходящий порт${NC} зарубежного сервера."
+    echo -e "2. Введите ${YELLOW}наименование${NC}, ${YELLOW}IP${NC}, ${YELLOW}входящий порт${NC} этого сервера и ${YELLOW}порт назначения${NC} зарубежного сервера."
     echo -e "3. Скрипт создаст 'мост' через этот VPS."
     echo ""
     echo -e "${CYAN}ШАГ 3: Настройка клиентского приложения (Важно!)${NC}"
@@ -141,6 +141,13 @@ configure_rule() {
     echo -e "\n${CYAN}--- Настройка $NAME ($PROTO) ---${NC}"
 
     while true; do
+        echo -e "Введите наименование сервера (например, NL-1 или Германия):"
+        read -p "> " SERVER_NAME
+        if [[ -n "$SERVER_NAME" && ${#SERVER_NAME} -le 100 && "$SERVER_NAME" != *'|'* && "$SERVER_NAME" != *'"'* ]]; then break; fi
+        echo -e "${RED}Ошибка: наименование должно содержать от 1 до 100 символов и не может содержать | и \".${NC}"
+    done
+
+    while true; do
         echo -e "Введите IP адрес конечного сервера:"
         read -p "> " TARGET_IP
         if [[ -n "$TARGET_IP" ]]; then break; fi
@@ -154,7 +161,7 @@ configure_rule() {
     done
 
     while true; do
-        echo -e "Введите исходящий порт (порт конечного сервера):"
+        echo -e "Введите порт назначения (порт конечного сервера):"
         read -p "> " OUT_PORT
         if [[ "$OUT_PORT" =~ ^[0-9]+$ ]] && [ "$OUT_PORT" -ge 1 ] && [ "$OUT_PORT" -le 65535 ]; then break; fi
         echo -e "${RED}Ошибка: порт должен быть числом от 1 до 65535!${NC}"
@@ -168,13 +175,17 @@ configure_rule() {
 
     echo -e "${YELLOW}[*] Применение правил...${NC}"
 
+    RULE_COMMENT="routing:$SERVER_NAME"
+
+    iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
+    # Совместимость с правилами, созданными старой версией скрипта без комментария.
     iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
     iptables -D INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
     iptables -D FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
 
     iptables -A INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT
-    iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"
+    iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"
     
     if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
         iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
@@ -192,19 +203,22 @@ configure_rule() {
     netfilter-persistent save > /dev/null
     
     echo -e "${GREEN}[SUCCESS] Туннель успешно настроен!${NC}"
-    echo -e "$PROTO: Порт $IN_PORT -> $TARGET_IP:$OUT_PORT"
+    echo -e "$SERVER_NAME: $PROTO, порт $IN_PORT -> $TARGET_IP:$OUT_PORT"
     read -p "Нажмите Enter для возврата в меню..."
 }
 
 # --- СПИСОК ПРАВИЛ ---
 list_active_rules() {
     echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
-    echo -e "${MAGENTA}ВХОДЯЩИЙ ПОРТ\tПРОТОКОЛ\tЦЕЛЬ${NC}"
+    echo -e "${MAGENTA}НАИМЕНОВАНИЕ\tВХОДЯЩИЙ ПОРТ\tПРОТОКОЛ\tЦЕЛЬ${NC}"
     iptables -t nat -S PREROUTING | grep "DNAT" | while read -r line ; do
         l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
         l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        if [[ -n "$l_port" ]]; then echo -e "$l_port\t\t$l_proto\t\t$l_dest"; fi
+        l_comment=$(echo "$line" | sed -n 's/.*--comment "\(routing:[^"]*\)".*/\1/p')
+        l_name="${l_comment#routing:}"
+        if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
+        if [[ -n "$l_port" ]]; then echo -e "$l_name\t\t$l_port\t\t$l_proto\t\t$l_dest"; fi
     done
     echo ""
     read -p "Нажмите Enter..."
@@ -219,9 +233,12 @@ delete_single_rule() {
         l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
         l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
+        l_comment=$(echo "$line" | sed -n 's/.*--comment "\(routing:[^"]*\)".*/\1/p')
+        l_name="${l_comment#routing:}"
+        if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
         if [[ -n "$l_port" ]]; then
-            RULES_LIST[$i]="$l_port|$l_proto|$l_dest"
-            echo -e "${YELLOW}[$i]${NC} Входящий порт: $l_port ($l_proto) -> $l_dest"
+            RULES_LIST[$i]="$l_port|$l_proto|$l_dest|$l_comment"
+            echo -e "${YELLOW}[$i]${NC} $l_name: входящий порт $l_port ($l_proto) -> $l_dest"
             ((i++))
         fi
     done < <(iptables -t nat -S PREROUTING | grep "DNAT")
@@ -236,11 +253,15 @@ delete_single_rule() {
     read -p "Номер правила для удаления (или введите число 0 для отмены): " rule_num
     if [[ "$rule_num" == "0" || -z "${RULES_LIST[$rule_num]}" ]]; then return; fi
 
-    IFS='|' read -r d_port d_proto d_dest <<< "${RULES_LIST[$rule_num]}"
+    IFS='|' read -r d_port d_proto d_dest d_comment <<< "${RULES_LIST[$rule_num]}"
     d_target_ip="${d_dest%:*}"
     d_target_port="${d_dest##*:}"
     
-    iptables -t nat -D PREROUTING -p "$d_proto" --dport "$d_port" -j DNAT --to-destination "$d_dest" 2>/dev/null
+    if [[ -n "$d_comment" ]]; then
+        iptables -t nat -D PREROUTING -p "$d_proto" --dport "$d_port" -m comment --comment "$d_comment" -j DNAT --to-destination "$d_dest" 2>/dev/null
+    else
+        iptables -t nat -D PREROUTING -p "$d_proto" --dport "$d_port" -j DNAT --to-destination "$d_dest" 2>/dev/null
+    fi
     iptables -D INPUT -p "$d_proto" --dport "$d_port" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -p "$d_proto" -d "$d_target_ip" --dport "$d_target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
     iptables -D FORWARD -p "$d_proto" -s "$d_target_ip" --sport "$d_target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
