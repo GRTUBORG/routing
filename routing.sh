@@ -50,9 +50,16 @@ prepare_system() {
 
     # Установка зависимостей
     export DEBIAN_FRONTEND=noninteractive
-    if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+    local packages_to_install=()
+    local package
+    for package in iptables-persistent netfilter-persistent qrencode conntrack; do
+        if ! dpkg -s "$package" >/dev/null 2>&1; then
+            packages_to_install+=("$package")
+        fi
+    done
+    if [ ${#packages_to_install[@]} -gt 0 ]; then
         apt-get update -y > /dev/null
-        apt-get install -y iptables-persistent netfilter-persistent qrencode > /dev/null
+        apt-get install -y "${packages_to_install[@]}" > /dev/null
     fi
 }
 
@@ -133,6 +140,49 @@ show_instructions() {
     read -p "Нажмите Enter, чтобы вернуться в меню..."
 }
 
+# Удаляет прежний DNAT с тем же протоколом и входящим портом.
+# Это исключает ситуацию, когда старое правило стоит выше нового и забирает весь трафик.
+remove_conflicting_rules() {
+    local proto="$1"
+    local in_port="$2"
+    local line
+    local rule_index
+    local match_index
+    local old_dest
+    local old_ip
+    local old_port
+
+    while true; do
+        rule_index=0
+        match_index=""
+        old_dest=""
+
+        while read -r line; do
+            [[ "$line" == "-A PREROUTING "* ]] || continue
+            ((rule_index++))
+            [[ "$line" == *"-j DNAT"* ]] || continue
+
+            if [[ "$(extract_rule_proto "$line")" == "$proto" && "$(extract_rule_port "$line")" == "$in_port" ]]; then
+                match_index="$rule_index"
+                old_dest=$(extract_rule_destination "$line")
+                break
+            fi
+        done < <(iptables -t nat -S PREROUTING)
+
+        [[ -n "$match_index" ]] || break
+        iptables -t nat -D PREROUTING "$match_index" || return 1
+
+        if [[ -n "$old_dest" ]]; then
+            old_ip="${old_dest%:*}"
+            old_port="${old_dest##*:}"
+            iptables -D FORWARD -p "$proto" -d "$old_ip" --dport "$old_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+            iptables -D FORWARD -p "$proto" -s "$old_ip" --sport "$old_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        fi
+    done
+
+    while iptables -D INPUT -p "$proto" --dport "$in_port" -j ACCEPT 2>/dev/null; do :; done
+}
+
 # --- ЯДРО НАСТРОЙКИ ---
 configure_rule() {
     local PROTO=$1
@@ -167,7 +217,7 @@ configure_rule() {
         echo -e "${RED}Ошибка: порт должен быть числом от 1 до 65535!${NC}"
     done
 
-    IFACE=$(ip route get 8.8.8.8 | awk -- '{printf $5}')
+    IFACE=$(ip route get "$TARGET_IP" | awk -- '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
     if [[ -z "$IFACE" ]]; then
         echo -e "${RED}[ERROR] Скрипту не удалось определить интерфейс!${NC}"
         exit 1
@@ -177,30 +227,61 @@ configure_rule() {
 
     RULE_COMMENT="routing:$SERVER_NAME"
 
-    iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
-    # Совместимость с правилами, созданными старой версией скрипта без комментария.
-    iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
-    iptables -D INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    if ! remove_conflicting_rules "$PROTO" "$IN_PORT"; then
+        echo -e "${RED}[ERROR] Не удалось удалить старое правило для порта $IN_PORT/$PROTO.${NC}"
+        read -p "Нажмите Enter для возврата в меню..."
+        return
+    fi
 
-    iptables -A INPUT -p "$PROTO" --dport "$IN_PORT" -j ACCEPT
-    iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"
-    
+    if ! iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"; then
+        echo -e "${RED}[ERROR] Не удалось создать DNAT. Проверьте поддержку iptables comment и введённые данные.${NC}"
+        read -p "Нажмите Enter для возврата в меню..."
+        return
+    fi
+
     if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+        if ! iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE; then
+            iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
+            echo -e "${RED}[ERROR] Не удалось создать MASQUERADE на интерфейсе $IFACE.${NC}"
+            read -p "Нажмите Enter для возврата в меню..."
+            return
+        fi
     fi
 
-    iptables -A FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
-    iptables -A FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$IN_PORT"/"$PROTO" >/dev/null
-        sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-        ufw reload >/dev/null
+    if ! iptables -I FORWARD 1 -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT; then
+        echo -e "${RED}[ERROR] Не удалось разрешить пересылку трафика в цепочке FORWARD.${NC}"
+        iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
+        read -p "Нажмите Enter для возврата в меню..."
+        return
     fi
 
-    netfilter-persistent save > /dev/null
+    if ! iptables -I FORWARD 1 -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT; then
+        echo -e "${RED}[ERROR] Не удалось разрешить обратный трафик в цепочке FORWARD.${NC}"
+        iptables -D FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
+        read -p "Нажмите Enter для возврата в меню..."
+        return
+    fi
+
+    # После замены маршрута удаляем старую запись NAT-соединения.
+    # Иначе постоянный UDP-поток (например, WireGuard) продолжит идти по прежнему DNAT.
+    if command -v conntrack &> /dev/null; then
+        conntrack -D -p "$PROTO" --dport "$IN_PORT" >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "1" ]] ||
+       ! iptables -t nat -C PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null ||
+       ! iptables -C FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
+       ! iptables -C FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
+       ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
+        echo -e "${RED}[ERROR] Проверка созданного маршрута не пройдена. Успешный статус не сохранён.${NC}"
+        read -p "Нажмите Enter для возврата в меню..."
+        return
+    fi
+
+    if ! netfilter-persistent save > /dev/null; then
+        echo -e "${YELLOW}[WARNING] Маршрут активен, но не удалось сохранить его для перезагрузки.${NC}"
+    fi
     
     echo -e "${GREEN}[SUCCESS] Туннель успешно настроен!${NC}"
     echo -e "$SERVER_NAME: $PROTO, порт $IN_PORT -> $TARGET_IP:$OUT_PORT"
@@ -343,6 +424,10 @@ delete_single_rule() {
     iptables -D INPUT -p "$d_proto" --dport "$d_port" -j ACCEPT 2>/dev/null
     iptables -D FORWARD -p "$d_proto" -d "$d_target_ip" --dport "$d_target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
     iptables -D FORWARD -p "$d_proto" -s "$d_target_ip" --sport "$d_target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+
+    if command -v conntrack &> /dev/null; then
+        conntrack -D -p "$d_proto" --dport "$d_port" >/dev/null 2>&1 || true
+    fi
     
     netfilter-persistent save > /dev/null
     echo -e "${GREEN}[OK] Удалено.${NC}"
