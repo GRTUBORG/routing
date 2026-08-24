@@ -10,6 +10,7 @@ WHITE='\033[1;37m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 PROMO_MARKER_FILE='/var/lib/routing/.promo_shown'
+NAMES_FILE='/var/lib/routing/names.db'
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -32,6 +33,10 @@ check_root() {
 
 # --- ПОДГОТОВКА СИСТЕМЫ ---
 prepare_system() {
+    mkdir -p "$(dirname "$NAMES_FILE")"
+    touch "$NAMES_FILE"
+    chmod 600 "$NAMES_FILE"
+
     # Включение IP Forwarding
     if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
@@ -61,6 +66,8 @@ prepare_system() {
         apt-get update -y > /dev/null
         apt-get install -y "${packages_to_install[@]}" > /dev/null
     fi
+
+    migrate_legacy_names
 }
 
 # --- ПРОМО БЛОК ---
@@ -177,6 +184,7 @@ remove_conflicting_rules() {
             old_port="${old_dest##*:}"
             iptables -D FORWARD -p "$proto" -d "$old_ip" --dport "$old_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
             iptables -D FORWARD -p "$proto" -s "$old_ip" --sport "$old_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+            delete_rule_name "$proto" "$in_port" "$old_dest" 2>/dev/null || true
         fi
     done
 
@@ -225,23 +233,21 @@ configure_rule() {
 
     echo -e "${YELLOW}[*] Применение правил...${NC}"
 
-    RULE_COMMENT="routing:$SERVER_NAME"
-
     if ! remove_conflicting_rules "$PROTO" "$IN_PORT"; then
         echo -e "${RED}[ERROR] Не удалось удалить старое правило для порта $IN_PORT/$PROTO.${NC}"
         read -p "Нажмите Enter для возврата в меню..."
         return
     fi
 
-    if ! iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"; then
-        echo -e "${RED}[ERROR] Не удалось создать DNAT. Проверьте поддержку iptables comment и введённые данные.${NC}"
+    if ! iptables -t nat -A PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT"; then
+        echo -e "${RED}[ERROR] Не удалось создать DNAT. Проверьте введённые данные.${NC}"
         read -p "Нажмите Enter для возврата в меню..."
         return
     fi
 
     if ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
         if ! iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE; then
-            iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
+            iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
             echo -e "${RED}[ERROR] Не удалось создать MASQUERADE на интерфейсе $IFACE.${NC}"
             read -p "Нажмите Enter для возврата в меню..."
             return
@@ -250,7 +256,7 @@ configure_rule() {
 
     if ! iptables -I FORWARD 1 -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT; then
         echo -e "${RED}[ERROR] Не удалось разрешить пересылку трафика в цепочке FORWARD.${NC}"
-        iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
+        iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
         read -p "Нажмите Enter для возврата в меню..."
         return
     fi
@@ -258,7 +264,7 @@ configure_rule() {
     if ! iptables -I FORWARD 1 -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT; then
         echo -e "${RED}[ERROR] Не удалось разрешить обратный трафик в цепочке FORWARD.${NC}"
         iptables -D FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-        iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
+        iptables -t nat -D PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null
         read -p "Нажмите Enter для возврата в меню..."
         return
     fi
@@ -270,13 +276,17 @@ configure_rule() {
     fi
 
     if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "1" ]] ||
-       ! iptables -t nat -C PREROUTING -p "$PROTO" --dport "$IN_PORT" -m comment --comment "$RULE_COMMENT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null ||
+       ! iptables -t nat -C PREROUTING -p "$PROTO" --dport "$IN_PORT" -j DNAT --to-destination "$TARGET_IP:$OUT_PORT" 2>/dev/null ||
        ! iptables -C FORWARD -p "$PROTO" -d "$TARGET_IP" --dport "$OUT_PORT" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
        ! iptables -C FORWARD -p "$PROTO" -s "$TARGET_IP" --sport "$OUT_PORT" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
        ! iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null; then
         echo -e "${RED}[ERROR] Проверка созданного маршрута не пройдена. Успешный статус не сохранён.${NC}"
         read -p "Нажмите Enter для возврата в меню..."
         return
+    fi
+
+    if ! set_rule_name "$PROTO" "$IN_PORT" "$TARGET_IP:$OUT_PORT" "$SERVER_NAME"; then
+        echo -e "${YELLOW}[WARNING] Маршрут создан, но не удалось сохранить его наименование.${NC}"
     fi
 
     if ! netfilter-persistent save > /dev/null; then
@@ -317,6 +327,88 @@ extract_rule_destination() {
     local line="$1"
     local regex='--to-destination[[:space:]]+([0-9.:]+)'
     if [[ "$line" =~ $regex ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
+}
+
+get_rule_name() {
+    local proto="$1"
+    local port="$2"
+    local destination="$3"
+
+    [[ -f "$NAMES_FILE" ]] || return
+    awk -F'|' -v proto="$proto" -v port="$port" -v destination="$destination" '
+        $1 == proto && $2 == port && $3 == destination { print $4; exit }
+    ' "$NAMES_FILE"
+}
+
+set_rule_name() {
+    local proto="$1"
+    local port="$2"
+    local destination="$3"
+    local name="$4"
+    local temp_file
+
+    mkdir -p "$(dirname "$NAMES_FILE")" || return 1
+    touch "$NAMES_FILE" || return 1
+    temp_file=$(mktemp "${NAMES_FILE}.tmp.XXXXXX") || return 1
+
+    if ! awk -F'|' -v proto="$proto" -v port="$port" -v destination="$destination" '
+        !($1 == proto && $2 == port && $3 == destination)
+    ' "$NAMES_FILE" > "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    if ! printf '%s|%s|%s|%s\n' "$proto" "$port" "$destination" "$name" >> "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    chmod 600 "$temp_file"
+    mv -f "$temp_file" "$NAMES_FILE"
+}
+
+delete_rule_name() {
+    local proto="$1"
+    local port="$2"
+    local destination="$3"
+    local temp_file
+
+    [[ -f "$NAMES_FILE" ]] || return 0
+    temp_file=$(mktemp "${NAMES_FILE}.tmp.XXXXXX") || return 1
+
+    if ! awk -F'|' -v proto="$proto" -v port="$port" -v destination="$destination" '
+        !($1 == proto && $2 == port && $3 == destination)
+    ' "$NAMES_FILE" > "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    chmod 600 "$temp_file"
+    mv -f "$temp_file" "$NAMES_FILE"
+}
+
+migrate_legacy_names() {
+    local line
+    local proto
+    local port
+    local destination
+    local comment
+    local name
+
+    while read -r line; do
+        [[ "$line" == *"-j DNAT"* ]] || continue
+        proto=$(extract_rule_proto "$line")
+        port=$(extract_rule_port "$line")
+        destination=$(extract_rule_destination "$line")
+        [[ -n "$proto" && -n "$port" && -n "$destination" ]] || continue
+        [[ -z "$(get_rule_name "$proto" "$port" "$destination")" ]] || continue
+
+        comment=$(extract_rule_comment "$line")
+        name="${comment#routing:}"
+        if [[ -n "$name" ]]; then
+            set_rule_name "$proto" "$port" "$destination" "$name" 2>/dev/null || true
+        fi
+    done < <(iptables -t nat -S PREROUTING 2>/dev/null)
 }
 
 print_rule_table_row() {
@@ -363,8 +455,12 @@ list_active_rules() {
             l_port=$(extract_rule_port "$line")
             l_proto=$(extract_rule_proto "$line")
             l_dest=$(extract_rule_destination "$line")
-            l_comment=$(extract_rule_comment "$line")
-            l_name="${l_comment#routing:}"
+            l_name=$(get_rule_name "$l_proto" "$l_port" "$l_dest")
+            # Однократная совместимость с именами из прежних версий скрипта.
+            if [[ -z "$l_name" ]]; then
+                l_comment=$(extract_rule_comment "$line")
+                l_name="${l_comment#routing:}"
+            fi
             if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
             if [[ -n "$l_port" ]]; then printf '%s|%s|%s|%s\n' "$l_port" "$l_name" "$l_proto" "$l_dest"; fi
         done | sort -t'|' -k1,1n
@@ -393,7 +489,8 @@ delete_single_rule() {
         l_proto=$(extract_rule_proto "$line")
         l_dest=$(extract_rule_destination "$line")
         l_comment=$(extract_rule_comment "$line")
-        l_name="${l_comment#routing:}"
+        l_name=$(get_rule_name "$l_proto" "$l_port" "$l_dest")
+        if [[ -z "$l_name" ]]; then l_name="${l_comment#routing:}"; fi
         if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
         if [[ -n "$l_port" ]]; then
             RULES_LIST[$i]="$l_port|$l_proto|$l_dest|$l_comment"
@@ -428,6 +525,8 @@ delete_single_rule() {
     if command -v conntrack &> /dev/null; then
         conntrack -D -p "$d_proto" --dport "$d_port" >/dev/null 2>&1 || true
     fi
+
+    delete_rule_name "$d_proto" "$d_port" "$d_dest" 2>/dev/null || true
     
     netfilter-persistent save > /dev/null
     echo -e "${GREEN}[OK] Удалено.${NC}"
@@ -439,29 +538,25 @@ rename_rule() {
     echo -e "\n${CYAN}--- Наименование правила ---${NC}"
     declare -a RENAME_RULES
     local i=1
-    local rule_index=0
 
-    while IFS='|' read -r r_port r_index r_proto r_dest r_comment; do
-        r_name="${r_comment#routing:}"
-        if [[ -z "$r_name" ]]; then r_name="Без имени"; fi
-        RENAME_RULES[$i]="$r_index|$r_port|$r_proto|$r_dest|$r_comment"
+    while IFS='|' read -r r_port r_proto r_dest r_name; do
+        RENAME_RULES[$i]="$r_port|$r_proto|$r_dest"
         echo -e "${YELLOW}[$i]${NC} $r_name: входящий порт $r_port ($r_proto) -> $r_dest"
         ((i++))
     done < <(
         while read -r line; do
-            if [[ "$line" == "-A PREROUTING "* ]]; then
-                ((rule_index++))
-            else
-                continue
-            fi
-
             [[ "$line" == *"-j DNAT"* ]] || continue
             r_port=$(extract_rule_port "$line")
             r_proto=$(extract_rule_proto "$line")
             r_dest=$(extract_rule_destination "$line")
-            r_comment=$(extract_rule_comment "$line")
+            r_name=$(get_rule_name "$r_proto" "$r_port" "$r_dest")
+            if [[ -z "$r_name" ]]; then
+                r_comment=$(extract_rule_comment "$line")
+                r_name="${r_comment#routing:}"
+            fi
+            if [[ -z "$r_name" ]]; then r_name="Без имени"; fi
             if [[ -n "$r_port" && -n "$r_proto" && -n "$r_dest" ]]; then
-                printf '%s|%s|%s|%s|%s\n' "$r_port" "$rule_index" "$r_proto" "$r_dest" "$r_comment"
+                printf '%s|%s|%s|%s\n' "$r_port" "$r_proto" "$r_dest" "$r_name"
             fi
         done < <(iptables -t nat -S PREROUTING) |
             sort -t'|' -k1,1n
@@ -484,9 +579,8 @@ rename_rule() {
         echo -e "${RED}Ошибка: наименование должно содержать от 1 до 100 символов и не может содержать | и \".${NC}"
     done
 
-    IFS='|' read -r r_index r_port r_proto r_dest r_old_comment <<< "${RENAME_RULES[$rule_num]}"
-    if iptables -t nat -R PREROUTING "$r_index" -p "$r_proto" --dport "$r_port" -m comment --comment "routing:$new_name" -j DNAT --to-destination "$r_dest"; then
-        netfilter-persistent save > /dev/null
+    IFS='|' read -r r_port r_proto r_dest <<< "${RENAME_RULES[$rule_num]}"
+    if set_rule_name "$r_proto" "$r_port" "$r_dest" "$new_name"; then
         echo -e "${GREEN}[OK] Правилу присвоено имя: $new_name${NC}"
     else
         echo -e "${RED}[ERROR] Не удалось изменить наименование правила.${NC}"
@@ -507,6 +601,7 @@ flush_rules() {
         iptables -t mangle -F
         iptables -F
         iptables -X
+        : > "$NAMES_FILE"
         netfilter-persistent save > /dev/null
         echo -e "${GREEN}[OK] Очищено.${NC}"
     fi
