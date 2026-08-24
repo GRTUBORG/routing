@@ -207,6 +207,20 @@ configure_rule() {
     read -p "Нажмите Enter для возврата в меню..."
 }
 
+# --- РАБОТА С НАИМЕНОВАНИЯМИ ПРАВИЛ ---
+extract_rule_comment() {
+    local line="$1"
+    local comment
+
+    # В зависимости от версии iptables комментарий может выводиться в кавычках или без них.
+    comment=$(echo "$line" | sed -n 's/.*--comment "\(routing:[^"]*\)".*/\1/p')
+    if [[ -z "$comment" ]]; then
+        comment=$(echo "$line" | grep -oP '(?<=--comment )routing:[^[:space:]]+' | head -n 1)
+    fi
+
+    printf '%s' "$comment"
+}
+
 # --- СПИСОК ПРАВИЛ ---
 list_active_rules() {
     echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
@@ -215,7 +229,7 @@ list_active_rules() {
         l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
         l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        l_comment=$(echo "$line" | sed -n 's/.*--comment "\(routing:[^"]*\)".*/\1/p')
+        l_comment=$(extract_rule_comment "$line")
         l_name="${l_comment#routing:}"
         if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
         if [[ -n "$l_port" ]]; then printf '%s|%s|%s|%s\n' "$l_port" "$l_name" "$l_proto" "$l_dest"; fi
@@ -235,7 +249,7 @@ delete_single_rule() {
         l_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
         l_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
         l_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
-        l_comment=$(echo "$line" | sed -n 's/.*--comment "\(routing:[^"]*\)".*/\1/p')
+        l_comment=$(extract_rule_comment "$line")
         l_name="${l_comment#routing:}"
         if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
         if [[ -n "$l_port" ]]; then
@@ -270,6 +284,66 @@ delete_single_rule() {
     
     netfilter-persistent save > /dev/null
     echo -e "${GREEN}[OK] Удалено.${NC}"
+    read -p "Нажмите Enter..."
+}
+
+# --- ПРИСВОЕНИЕ ИЛИ ИЗМЕНЕНИЕ НАИМЕНОВАНИЯ ---
+rename_rule() {
+    echo -e "\n${CYAN}--- Наименование правила ---${NC}"
+    declare -a RENAME_RULES
+    local i=1
+    local rule_index=0
+
+    while IFS='|' read -r r_port r_index r_proto r_dest r_comment; do
+        r_name="${r_comment#routing:}"
+        if [[ -z "$r_name" ]]; then r_name="Без имени"; fi
+        RENAME_RULES[$i]="$r_index|$r_port|$r_proto|$r_dest|$r_comment"
+        echo -e "${YELLOW}[$i]${NC} $r_name: входящий порт $r_port ($r_proto) -> $r_dest"
+        ((i++))
+    done < <(
+        while read -r line; do
+            if [[ "$line" == "-A PREROUTING "* ]]; then
+                ((rule_index++))
+            else
+                continue
+            fi
+
+            [[ "$line" == *"-j DNAT"* ]] || continue
+            r_port=$(echo "$line" | grep -oP '(?<=--dport )\d+')
+            r_proto=$(echo "$line" | grep -oP '(?<=-p )\w+')
+            r_dest=$(echo "$line" | grep -oP '(?<=--to-destination )[\d\.:]+')
+            r_comment=$(extract_rule_comment "$line")
+            if [[ -n "$r_port" && -n "$r_proto" && -n "$r_dest" ]]; then
+                printf '%s|%s|%s|%s|%s\n' "$r_port" "$rule_index" "$r_proto" "$r_dest" "$r_comment"
+            fi
+        done < <(iptables -t nat -S PREROUTING) |
+            sort -t'|' -k1,1n
+    )
+
+    if [ ${#RENAME_RULES[@]} -eq 0 ]; then
+        echo -e "${RED}Нет активных правил.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    echo ""
+    read -p "Номер правила (или 0 для отмены): " rule_num
+    if [[ "$rule_num" == "0" || -z "${RENAME_RULES[$rule_num]}" ]]; then return; fi
+
+    while true; do
+        echo -e "Введите новое наименование сервера:"
+        read -p "> " new_name
+        if [[ -n "$new_name" && ${#new_name} -le 100 && "$new_name" != *'|'* && "$new_name" != *'"'* ]]; then break; fi
+        echo -e "${RED}Ошибка: наименование должно содержать от 1 до 100 символов и не может содержать | и \".${NC}"
+    done
+
+    IFS='|' read -r r_index r_port r_proto r_dest r_old_comment <<< "${RENAME_RULES[$rule_num]}"
+    if iptables -t nat -R PREROUTING "$r_index" -p "$r_proto" --dport "$r_port" -m comment --comment "routing:$new_name" -j DNAT --to-destination "$r_dest"; then
+        netfilter-persistent save > /dev/null
+        echo -e "${GREEN}[OK] Правилу присвоено имя: $new_name${NC}"
+    else
+        echo -e "${RED}[ERROR] Не удалось изменить наименование правила.${NC}"
+    fi
     read -p "Нажмите Enter..."
 }
 
@@ -310,6 +384,7 @@ show_menu() {
         echo -e "5) ${RED}Сбросить ВСЕ настройки${NC}"
         echo -e "6) ${YELLOW}Показать PROMO${NC}"
         echo -e "7) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
+        echo -e "8) ${CYAN}Присвоить / изменить наименование правила${NC}"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
@@ -322,6 +397,7 @@ show_menu() {
             5) flush_rules ;;
             6) show_promo ;;
             7) show_instructions ;;
+            8) rename_rule ;;
             0) exit 0 ;;
             *) ;;
         esac
