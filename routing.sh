@@ -11,6 +11,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 PROMO_MARKER_FILE='/var/lib/routing/.promo_shown'
 NAMES_FILE='/var/lib/routing/names.db'
+GROUPS_FILE='/var/lib/routing/groups.db'
 
 # Корректная обработка кириллицы и Backspace в интерактивном терминале.
 if LC_ALL=C.UTF-8 locale charmap >/dev/null 2>&1; then
@@ -65,6 +66,8 @@ prepare_system() {
     mkdir -p "$(dirname "$NAMES_FILE")"
     touch "$NAMES_FILE"
     chmod 600 "$NAMES_FILE"
+    touch "$GROUPS_FILE"
+    chmod 600 "$GROUPS_FILE"
 
     # Включение IP Forwarding
     if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
@@ -214,6 +217,7 @@ remove_conflicting_rules() {
             iptables -D FORWARD -p "$proto" -d "$old_ip" --dport "$old_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
             iptables -D FORWARD -p "$proto" -s "$old_ip" --sport "$old_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
             delete_rule_name "$proto" "$in_port" "$old_dest" 2>/dev/null || true
+            delete_rule_group "$proto" "$in_port" "$old_dest" 2>/dev/null || true
         fi
     done
 
@@ -420,6 +424,80 @@ delete_rule_name() {
     mv -f "$temp_file" "$NAMES_FILE"
 }
 
+get_rule_group() {
+    local proto="$1"
+    local port="$2"
+    local destination="$3"
+    local group
+
+    [[ -f "$GROUPS_FILE" ]] || return
+    group=$(awk -F'|' -v proto="$proto" -v port="$port" -v destination="$destination" '
+        $1 == proto && $2 == port && $3 == destination { print $4; exit }
+    ' "$GROUPS_FILE")
+    if [[ -n "$group" ]] && is_valid_utf8 "$group"; then printf '%s' "$group"; fi
+}
+
+set_rule_group() {
+    local proto="$1"
+    local port="$2"
+    local destination="$3"
+    local group="$4"
+    local temp_file
+
+    [[ -n "$group" && ${#group} -le 100 && "$group" != *'|'* ]] || return 1
+    is_valid_utf8 "$group" || return 1
+    mkdir -p "$(dirname "$GROUPS_FILE")" || return 1
+    touch "$GROUPS_FILE" || return 1
+    temp_file=$(mktemp "${GROUPS_FILE}.tmp.XXXXXX") || return 1
+
+    if ! awk -F'|' -v proto="$proto" -v port="$port" -v destination="$destination" '
+        !($1 == proto && $2 == port && $3 == destination)
+    ' "$GROUPS_FILE" > "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    if ! printf '%s|%s|%s|%s\n' "$proto" "$port" "$destination" "$group" >> "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    chmod 600 "$temp_file"
+    mv -f "$temp_file" "$GROUPS_FILE"
+}
+
+delete_rule_group() {
+    local proto="$1"
+    local port="$2"
+    local destination="$3"
+    local temp_file
+
+    [[ -f "$GROUPS_FILE" ]] || return 0
+    temp_file=$(mktemp "${GROUPS_FILE}.tmp.XXXXXX") || return 1
+    if ! awk -F'|' -v proto="$proto" -v port="$port" -v destination="$destination" '
+        !($1 == proto && $2 == port && $3 == destination)
+    ' "$GROUPS_FILE" > "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+    chmod 600 "$temp_file"
+    mv -f "$temp_file" "$GROUPS_FILE"
+}
+
+delete_group_records() {
+    local group="$1"
+    local temp_file
+
+    [[ -f "$GROUPS_FILE" ]] || return 0
+    temp_file=$(mktemp "${GROUPS_FILE}.tmp.XXXXXX") || return 1
+    if ! awk -F'|' -v group="$group" '$4 != group' "$GROUPS_FILE" > "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+    chmod 600 "$temp_file"
+    mv -f "$temp_file" "$GROUPS_FILE"
+}
+
 migrate_legacy_names() {
     local line
     local proto
@@ -444,18 +522,115 @@ migrate_legacy_names() {
     done < <(iptables -t nat -S PREROUTING 2>/dev/null)
 }
 
+emit_dnat_rules() {
+    local line
+    local rule_index=0
+    local port
+    local proto
+    local destination
+    local name
+    local comment
+    local group
+
+    while read -r line; do
+        [[ "$line" == "-A PREROUTING "* ]] || continue
+        ((rule_index++))
+        [[ "$line" == *"-j DNAT"* ]] || continue
+
+        port=$(extract_rule_port "$line")
+        proto=$(extract_rule_proto "$line")
+        destination=$(extract_rule_destination "$line")
+        [[ -n "$port" && -n "$proto" && -n "$destination" ]] || continue
+
+        name=$(get_rule_name "$proto" "$port" "$destination")
+        if [[ -z "$name" ]]; then
+            comment=$(extract_rule_comment "$line")
+            name="${comment#routing:}"
+        fi
+        if [[ -n "$name" ]] && ! is_valid_utf8 "$name"; then name=""; fi
+        group=$(get_rule_group "$proto" "$port" "$destination")
+
+        printf '%s|%s|%s|%s|%s|%s\n' "$port" "$rule_index" "$proto" "$destination" "$name" "$group"
+    done < <(iptables -t nat -S PREROUTING 2>/dev/null) | sort -t'|' -k1,1n
+}
+
+parse_rule_selection() {
+    local selection="$1"
+    local max_index="$2"
+    local token
+    local start
+    local end
+    local value
+    declare -A seen
+    SELECTED_INDICES=()
+
+    selection="${selection//,/ }"
+    if [[ "$selection" == "all" || "$selection" == "все" ]]; then
+        for ((value=1; value<=max_index; value++)); do SELECTED_INDICES+=("$value"); done
+        return 0
+    fi
+
+    for token in $selection; do
+        if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start=$((10#${BASH_REMATCH[1]}))
+            end=$((10#${BASH_REMATCH[2]}))
+            ((start >= 1 && end >= start && end <= max_index)) || return 1
+            for ((value=start; value<=end; value++)); do
+                if [[ -z "${seen[$value]}" ]]; then SELECTED_INDICES+=("$value"); seen[$value]=1; fi
+            done
+        elif [[ "$token" =~ ^[0-9]+$ ]]; then
+            value=$((10#$token))
+            ((value >= 1 && value <= max_index)) || return 1
+            if [[ -z "${seen[$value]}" ]]; then SELECTED_INDICES+=("$value"); seen[$value]=1; fi
+        else
+            return 1
+        fi
+    done
+
+    [ ${#SELECTED_INDICES[@]} -gt 0 ]
+}
+
+select_existing_group() {
+    declare -a GROUP_OPTIONS
+    local i=1
+    local group
+
+    while IFS= read -r group; do
+        [[ -n "$group" ]] || continue
+        GROUP_OPTIONS[$i]="$group"
+        echo -e "${YELLOW}[$i]${NC} $group"
+        ((i++))
+    done < <(
+        emit_dnat_rules | while IFS='|' read -r _ _ _ _ _ group; do
+            if [[ -n "$group" ]]; then printf '%s\n' "$group"; fi
+        done | sort -u
+    )
+
+    if [ ${#GROUP_OPTIONS[@]} -eq 0 ]; then
+        echo -e "${RED}Нет созданных групп.${NC}"
+        return 1
+    fi
+
+    read -p "Номер группы (или 0 для отмены): " group_num
+    if [[ ! "$group_num" =~ ^[0-9]+$ || "$group_num" == "0" || -z "${GROUP_OPTIONS[$group_num]}" ]]; then return 1; fi
+    SELECTED_GROUP="${GROUP_OPTIONS[$group_num]}"
+}
+
 print_rule_table_row() {
     local name="$1"
-    local port="$2"
-    local proto="$3"
-    local destination="$4"
-    local name_width="$5"
-    local port_width="$6"
-    local proto_width="$7"
+    local group="$2"
+    local port="$3"
+    local proto="$4"
+    local destination="$5"
+    local name_width="$6"
+    local group_width="$7"
+    local port_width="$8"
+    local proto_width="$9"
     local gap=3
 
-    printf '%s%*s%s%*s%s%*s%s\n' \
+    printf '%s%*s%s%*s%s%*s%s%*s%s\n' \
         "$name" "$((name_width - ${#name} + gap))" "" \
+        "$group" "$((group_width - ${#group} + gap))" "" \
         "$port" "$((port_width - ${#port} + gap))" "" \
         "$proto" "$((proto_width - ${#proto} + gap))" "" \
         "$destination"
@@ -466,47 +641,37 @@ list_active_rules() {
     echo -e "\n${CYAN}--- Активные переадресации ---${NC}"
     declare -a DISPLAY_RULES
     local NAME_HEADER="НАИМЕНОВАНИЕ"
+    local GROUP_HEADER="ГРУППА"
     local PORT_HEADER="ВХОДЯЩИЙ ПОРТ"
     local PROTO_HEADER="ПРОТОКОЛ"
     local DEST_HEADER="ЦЕЛЬ"
     local name_width
+    local group_width
     local port_width
     local proto_width
 
     name_width=${#NAME_HEADER}
+    group_width=${#GROUP_HEADER}
     port_width=${#PORT_HEADER}
     proto_width=${#PROTO_HEADER}
 
-    while IFS='|' read -r l_port l_name l_proto l_dest; do
-        DISPLAY_RULES+=("$l_port|$l_name|$l_proto|$l_dest")
+    while IFS='|' read -r l_port _ l_proto l_dest l_name l_group; do
+        if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
+        if [[ -z "$l_group" ]]; then l_group="—"; fi
+        DISPLAY_RULES+=("$l_port|$l_name|$l_group|$l_proto|$l_dest")
         if [ ${#l_name} -gt "$name_width" ]; then name_width=${#l_name}; fi
+        if [ ${#l_group} -gt "$group_width" ]; then group_width=${#l_group}; fi
         if [ ${#l_port} -gt "$port_width" ]; then port_width=${#l_port}; fi
         if [ ${#l_proto} -gt "$proto_width" ]; then proto_width=${#l_proto}; fi
-    done < <(
-        iptables -t nat -S PREROUTING | while read -r line ; do
-            [[ "$line" == *"-j DNAT"* ]] || continue
-            l_port=$(extract_rule_port "$line")
-            l_proto=$(extract_rule_proto "$line")
-            l_dest=$(extract_rule_destination "$line")
-            l_name=$(get_rule_name "$l_proto" "$l_port" "$l_dest")
-            # Однократная совместимость с именами из прежних версий скрипта.
-            if [[ -z "$l_name" ]]; then
-                l_comment=$(extract_rule_comment "$line")
-                l_name="${l_comment#routing:}"
-            fi
-            if [[ -n "$l_name" ]] && ! is_valid_utf8 "$l_name"; then l_name=""; fi
-            if [[ -z "$l_name" ]]; then l_name="Без имени"; fi
-            if [[ -n "$l_port" ]]; then printf '%s|%s|%s|%s\n' "$l_port" "$l_name" "$l_proto" "$l_dest"; fi
-        done | sort -t'|' -k1,1n
-    )
+    done < <(emit_dnat_rules)
 
     echo -ne "${MAGENTA}"
-    print_rule_table_row "$NAME_HEADER" "$PORT_HEADER" "$PROTO_HEADER" "$DEST_HEADER" "$name_width" "$port_width" "$proto_width"
+    print_rule_table_row "$NAME_HEADER" "$GROUP_HEADER" "$PORT_HEADER" "$PROTO_HEADER" "$DEST_HEADER" "$name_width" "$group_width" "$port_width" "$proto_width"
     echo -ne "${NC}"
 
     for rule in "${DISPLAY_RULES[@]}"; do
-        IFS='|' read -r l_port l_name l_proto l_dest <<< "$rule"
-        print_rule_table_row "$l_name" "$l_port" "$l_proto" "$l_dest" "$name_width" "$port_width" "$proto_width"
+        IFS='|' read -r l_port l_name l_group l_proto l_dest <<< "$rule"
+        print_rule_table_row "$l_name" "$l_group" "$l_port" "$l_proto" "$l_dest" "$name_width" "$group_width" "$port_width" "$proto_width"
     done
     echo ""
     read -p "Нажмите Enter..."
@@ -519,11 +684,12 @@ update_target_ip() {
     local i=1
     local rule_index=0
 
-    while IFS='|' read -r u_port u_index u_proto u_dest u_name; do
+    while IFS='|' read -r u_port u_index u_proto u_dest u_name u_group; do
         u_display_name="$u_name"
         if [[ -z "$u_display_name" ]]; then u_display_name="Без имени"; fi
-        UPDATE_RULES[$i]="$u_index|$u_port|$u_proto|$u_dest|$u_name"
-        echo -e "${YELLOW}[$i]${NC} $u_display_name: входящий порт $u_port ($u_proto) -> $u_dest"
+        UPDATE_RULES[$i]="$u_index|$u_port|$u_proto|$u_dest|$u_name|$u_group"
+        if [[ -n "$u_group" ]]; then u_group_label=" [группа: $u_group]"; else u_group_label=""; fi
+        echo -e "${YELLOW}[$i]${NC} $u_display_name$u_group_label: входящий порт $u_port ($u_proto) -> $u_dest"
         ((i++))
     done < <(
         while read -r line; do
@@ -540,9 +706,10 @@ update_target_ip() {
                 u_name="${u_comment#routing:}"
             fi
             if [[ -n "$u_name" ]] && ! is_valid_utf8 "$u_name"; then u_name=""; fi
+            u_group=$(get_rule_group "$u_proto" "$u_port" "$u_dest")
 
             if [[ -n "$u_port" && -n "$u_proto" && -n "$u_dest" ]]; then
-                printf '%s|%s|%s|%s|%s\n' "$u_port" "$rule_index" "$u_proto" "$u_dest" "$u_name"
+                printf '%s|%s|%s|%s|%s|%s\n' "$u_port" "$rule_index" "$u_proto" "$u_dest" "$u_name" "$u_group"
             fi
         done < <(iptables -t nat -S PREROUTING) |
             sort -t'|' -k1,1n
@@ -565,7 +732,7 @@ update_target_ip() {
         echo -e "${RED}Ошибка: введите корректный IPv4-адрес.${NC}"
     done
 
-    IFS='|' read -r u_index u_port u_proto u_dest u_name <<< "${UPDATE_RULES[$rule_num]}"
+    IFS='|' read -r u_index u_port u_proto u_dest u_name u_group <<< "${UPDATE_RULES[$rule_num]}"
     u_old_ip="${u_dest%:*}"
     u_out_port="${u_dest##*:}"
     u_new_dest="$new_target_ip:$u_out_port"
@@ -634,6 +801,16 @@ update_target_ip() {
         delete_rule_name "$u_proto" "$u_port" "$u_dest" 2>/dev/null || true
     fi
 
+    if [[ -n "$u_group" ]]; then
+        if set_rule_group "$u_proto" "$u_port" "$u_new_dest" "$u_group"; then
+            delete_rule_group "$u_proto" "$u_port" "$u_dest" 2>/dev/null || true
+        else
+            echo -e "${YELLOW}[WARNING] IP изменён, но не удалось перенести группу.${NC}"
+        fi
+    else
+        delete_rule_group "$u_proto" "$u_port" "$u_dest" 2>/dev/null || true
+    fi
+
     if command -v conntrack &> /dev/null; then
         conntrack -D -p "$u_proto" --dport "$u_port" >/dev/null 2>&1 || true
     fi
@@ -645,6 +822,87 @@ update_target_ip() {
     echo -e "${GREEN}[OK] Конечный IP изменён: $u_old_ip -> $new_target_ip${NC}"
     echo -e "$u_proto: порт $u_port -> $u_new_dest"
     read -p "Нажмите Enter..."
+}
+
+change_rule_target_ip() {
+    local rule_index="$1"
+    local in_port="$2"
+    local proto="$3"
+    local old_dest="$4"
+    local new_ip="$5"
+    local name="$6"
+    local group="$7"
+    local old_ip="${old_dest%:*}"
+    local out_port="${old_dest##*:}"
+    local new_dest="$new_ip:$out_port"
+    local iface
+
+    [[ "$new_ip" != "$old_ip" ]] || return 0
+    iface=$(ip route get "$new_ip" | awk -- '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+    if [[ -z "$iface" ]]; then
+        echo -e "${RED}[ERROR] Порт $in_port: нет маршрута до $new_ip.${NC}"
+        return 1
+    fi
+
+    if ! iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE 2>/dev/null; then
+        if ! iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE; then
+            echo -e "${RED}[ERROR] Порт $in_port: не удалось создать MASQUERADE.${NC}"
+            return 1
+        fi
+    fi
+
+    if ! iptables -I FORWARD 1 -p "$proto" -d "$new_ip" --dport "$out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT; then
+        echo -e "${RED}[ERROR] Порт $in_port: не удалось разрешить прямой трафик.${NC}"
+        return 1
+    fi
+    if ! iptables -I FORWARD 1 -p "$proto" -s "$new_ip" --sport "$out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT; then
+        iptables -D FORWARD -p "$proto" -d "$new_ip" --dport "$out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        echo -e "${RED}[ERROR] Порт $in_port: не удалось разрешить обратный трафик.${NC}"
+        return 1
+    fi
+
+    if ! iptables -t nat -R PREROUTING "$rule_index" -p "$proto" --dport "$in_port" -j DNAT --to-destination "$new_dest"; then
+        iptables -D FORWARD -p "$proto" -d "$new_ip" --dport "$out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -p "$proto" -s "$new_ip" --sport "$out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        echo -e "${RED}[ERROR] Порт $in_port: не удалось заменить DNAT.${NC}"
+        return 1
+    fi
+
+    if ! iptables -t nat -C PREROUTING -p "$proto" --dport "$in_port" -j DNAT --to-destination "$new_dest" 2>/dev/null; then
+        iptables -t nat -R PREROUTING "$rule_index" -p "$proto" --dport "$in_port" -j DNAT --to-destination "$old_dest" 2>/dev/null
+        iptables -D FORWARD -p "$proto" -d "$new_ip" --dport "$out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        iptables -D FORWARD -p "$proto" -s "$new_ip" --sport "$out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+        echo -e "${RED}[ERROR] Порт $in_port: проверка DNAT не пройдена, старое правило восстановлено.${NC}"
+        return 1
+    fi
+
+    iptables -D FORWARD -p "$proto" -d "$old_ip" --dport "$out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -p "$proto" -s "$old_ip" --sport "$out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+
+    if [[ -n "$name" ]]; then
+        if set_rule_name "$proto" "$in_port" "$new_dest" "$name"; then
+            delete_rule_name "$proto" "$in_port" "$old_dest" 2>/dev/null || true
+        else
+            echo -e "${YELLOW}[WARNING] Порт $in_port: не удалось перенести наименование.${NC}"
+        fi
+    else
+        delete_rule_name "$proto" "$in_port" "$old_dest" 2>/dev/null || true
+    fi
+
+    if [[ -n "$group" ]]; then
+        if set_rule_group "$proto" "$in_port" "$new_dest" "$group"; then
+            delete_rule_group "$proto" "$in_port" "$old_dest" 2>/dev/null || true
+        else
+            echo -e "${YELLOW}[WARNING] Порт $in_port: не удалось перенести группу.${NC}"
+        fi
+    else
+        delete_rule_group "$proto" "$in_port" "$old_dest" 2>/dev/null || true
+    fi
+
+    if command -v conntrack &> /dev/null; then
+        conntrack -D -p "$proto" --dport "$in_port" >/dev/null 2>&1 || true
+    fi
+    return 0
 }
 
 # --- УДАЛЕНИЕ ОДНОГО ПРАВИЛА ---
@@ -697,6 +955,7 @@ delete_single_rule() {
     fi
 
     delete_rule_name "$d_proto" "$d_port" "$d_dest" 2>/dev/null || true
+    delete_rule_group "$d_proto" "$d_port" "$d_dest" 2>/dev/null || true
     
     netfilter-persistent save > /dev/null
     echo -e "${GREEN}[OK] Удалено.${NC}"
@@ -759,6 +1018,201 @@ rename_rule() {
     read -p "Нажмите Enter..."
 }
 
+# --- УПРАВЛЕНИЕ ГРУППАМИ ---
+add_rules_to_group() {
+    echo -e "\n${CYAN}--- Создание группы / добавление правил ---${NC}"
+    declare -a GROUP_RULES
+    local i=1
+    local group_label
+
+    while IFS='|' read -r port _ proto destination name group; do
+        [[ -n "$name" ]] || name="Без имени"
+        if [[ -n "$group" ]]; then group_label="группа: $group"; else group_label="без группы"; fi
+        GROUP_RULES[$i]="$port|$proto|$destination"
+        echo -e "${YELLOW}[$i]${NC} $name: $port ($proto) -> $destination [$group_label]"
+        ((i++))
+    done < <(emit_dnat_rules)
+
+    if [ ${#GROUP_RULES[@]} -eq 0 ]; then
+        echo -e "${RED}Нет активных правил.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    while true; do
+        echo ""
+        read -r -e -p "Название группы: " group_name
+        if [[ -n "$group_name" && ${#group_name} -le 100 && "$group_name" != *'|'* ]] && is_valid_utf8 "$group_name"; then break; fi
+        echo -e "${RED}Название должно содержать от 1 до 100 символов и не может содержать |.${NC}"
+    done
+
+    read -r -p "Номера правил (например: 1 2 5-10 или all): " selection
+    if ! parse_rule_selection "$selection" "${#GROUP_RULES[@]}"; then
+        echo -e "${RED}Некорректный список правил.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    local updated=0
+    local selected
+    for selected in "${SELECTED_INDICES[@]}"; do
+        IFS='|' read -r port proto destination <<< "${GROUP_RULES[$selected]}"
+        if set_rule_group "$proto" "$port" "$destination" "$group_name"; then ((updated++)); fi
+    done
+
+    echo -e "${GREEN}[OK] В группу '$group_name' добавлено правил: $updated.${NC}"
+    read -p "Нажмите Enter..."
+}
+
+remove_rules_from_group() {
+    echo -e "\n${CYAN}--- Удаление правил из группы ---${NC}"
+    select_existing_group || { read -p "Нажмите Enter..."; return; }
+    declare -a MEMBER_RULES
+    local i=1
+
+    while IFS='|' read -r port _ proto destination name group; do
+        [[ "$group" == "$SELECTED_GROUP" ]] || continue
+        [[ -n "$name" ]] || name="Без имени"
+        MEMBER_RULES[$i]="$port|$proto|$destination"
+        echo -e "${YELLOW}[$i]${NC} $name: $port ($proto) -> $destination"
+        ((i++))
+    done < <(emit_dnat_rules)
+
+    read -r -p "Номера правил для исключения (например: 1 2 5-10 или all): " selection
+    if ! parse_rule_selection "$selection" "${#MEMBER_RULES[@]}"; then
+        echo -e "${RED}Некорректный список правил.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    local removed=0
+    local selected
+    for selected in "${SELECTED_INDICES[@]}"; do
+        IFS='|' read -r port proto destination <<< "${MEMBER_RULES[$selected]}"
+        if delete_rule_group "$proto" "$port" "$destination"; then ((removed++)); fi
+    done
+    echo -e "${GREEN}[OK] Из группы '$SELECTED_GROUP' исключено правил: $removed.${NC}"
+    read -p "Нажмите Enter..."
+}
+
+delete_group() {
+    echo -e "\n${CYAN}--- Удаление группы ---${NC}"
+    select_existing_group || { read -p "Нажмите Enter..."; return; }
+    read -r -p "Удалить группу '$SELECTED_GROUP'? Сами правила останутся. (y/n): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "yes" ]]; then
+        if delete_group_records "$SELECTED_GROUP"; then
+            echo -e "${GREEN}[OK] Группа '$SELECTED_GROUP' удалена, правила сохранены.${NC}"
+        else
+            echo -e "${RED}[ERROR] Не удалось удалить группу.${NC}"
+        fi
+    fi
+    read -p "Нажмите Enter..."
+}
+
+list_groups() {
+    echo -e "\n${CYAN}--- Состав групп ---${NC}"
+    local found=0
+    local current_group=""
+
+    while IFS='|' read -r group port name proto destination; do
+        [[ -n "$group" ]] || continue
+        found=1
+        if [[ "$group" != "$current_group" ]]; then
+            current_group="$group"
+            echo -e "\n${MAGENTA}[$current_group]${NC}"
+        fi
+        [[ -n "$name" ]] || name="Без имени"
+        echo -e "  $port ($proto) -> $destination — $name"
+    done < <(
+        emit_dnat_rules | while IFS='|' read -r port _ proto destination name group; do
+            if [[ -n "$group" ]]; then printf '%s|%s|%s|%s|%s\n' "$group" "$port" "$name" "$proto" "$destination"; fi
+        done | sort -t'|' -k1,1 -k2,2n
+    )
+
+    if [[ "$found" == 0 ]]; then echo -e "${RED}Нет созданных групп.${NC}"; fi
+    echo ""
+    read -p "Нажмите Enter..."
+}
+
+update_group_target_ip() {
+    echo -e "\n${CYAN}--- Массовая замена конечного IP группы ---${NC}"
+    select_existing_group || { read -p "Нажмите Enter..."; return; }
+    declare -a GROUP_UPDATE_RULES
+    local i=1
+
+    while IFS='|' read -r port rule_index proto destination name group; do
+        [[ "$group" == "$SELECTED_GROUP" ]] || continue
+        display_name="$name"
+        [[ -n "$display_name" ]] || display_name="Без имени"
+        GROUP_UPDATE_RULES[$i]="$rule_index|$port|$proto|$destination|$name|$group"
+        echo -e "${YELLOW}[$i]${NC} $display_name: $port ($proto) -> $destination"
+        ((i++))
+    done < <(emit_dnat_rules)
+
+    if [ ${#GROUP_UPDATE_RULES[@]} -eq 0 ]; then
+        echo -e "${RED}В группе нет активных правил.${NC}"
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    while true; do
+        echo ""
+        read -r -p "Новый конечный IPv4 для всей группы: " new_target_ip
+        if is_valid_ipv4 "$new_target_ip"; then break; fi
+        echo -e "${RED}Ошибка: введите корректный IPv4-адрес.${NC}"
+    done
+
+    read -r -p "Изменить IP у ${#GROUP_UPDATE_RULES[@]} правил группы '$SELECTED_GROUP' на $new_target_ip? (y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "yes" ]]; then return; fi
+
+    local success=0
+    local failed=0
+    local record
+    for record in "${GROUP_UPDATE_RULES[@]}"; do
+        IFS='|' read -r rule_index port proto destination name group <<< "$record"
+        if change_rule_target_ip "$rule_index" "$port" "$proto" "$destination" "$new_target_ip" "$name" "$group"; then
+            ((success++))
+        else
+            ((failed++))
+        fi
+    done
+
+    if ! netfilter-persistent save > /dev/null; then
+        echo -e "${YELLOW}[WARNING] Изменения активны, но не удалось сохранить их для перезагрузки.${NC}"
+    fi
+
+    if [[ "$failed" == 0 ]]; then
+        echo -e "${GREEN}[OK] IP группы '$SELECTED_GROUP' обновлён. Правил: $success.${NC}"
+    else
+        echo -e "${RED}[WARNING] Обновлено: $success, с ошибкой: $failed. Проверьте сообщения выше.${NC}"
+    fi
+    read -p "Нажмите Enter..."
+}
+
+groups_menu() {
+    while true; do
+        clear
+        echo -e "${MAGENTA}--- Управление группами ---${NC}"
+        echo "1) Создать группу / добавить правила"
+        echo "2) Убрать правила из группы"
+        echo "3) Удалить группу"
+        echo "4) Изменить конечный IP всей группы"
+        echo "5) Посмотреть состав групп"
+        echo "0) Вернуться в главное меню"
+        echo "------------------------------------------------------"
+        read -p "Ваш выбор: " group_choice
+        case "$group_choice" in
+            1) add_rules_to_group ;;
+            2) remove_rules_from_group ;;
+            3) delete_group ;;
+            4) update_group_target_ip ;;
+            5) list_groups ;;
+            0) return ;;
+            *) ;;
+        esac
+    done
+}
+
 # --- ПОЛНАЯ ОЧИСТКА ---
 flush_rules() {
     echo -e "\n${RED}!!! ВНИМАНИЕ !!!${NC}"
@@ -773,6 +1227,7 @@ flush_rules() {
         iptables -F
         iptables -X
         : > "$NAMES_FILE"
+        : > "$GROUPS_FILE"
         netfilter-persistent save > /dev/null
         echo -e "${GREEN}[OK] Очищено.${NC}"
     fi
@@ -793,12 +1248,13 @@ show_menu() {
         echo -e "1) Настроить ${CYAN}AmneziaWG / WireGuard${NC} (UDP)"
         echo -e "2) Настроить ${CYAN}VLESS / XRay${NC} (TCP)"
         echo -e "3) ${YELLOW}Быстро изменить конечный IP${NC}"
-        echo -e "4) Посмотреть активные правила"
-        echo -e "5) ${RED}Удалить одно правило${NC}"
-        echo -e "6) ${RED}Сбросить ВСЕ настройки${NC}"
-        echo -e "7) ${YELLOW}Показать PROMO${NC}"
-        echo -e "8) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
-        echo -e "9) ${CYAN}Присвоить / изменить наименование правила${NC}"
+        echo -e "4) ${CYAN}Управление группами${NC}"
+        echo -e "5) Посмотреть активные правила"
+        echo -e "6) ${RED}Удалить одно правило${NC}"
+        echo -e "7) ${RED}Сбросить ВСЕ настройки${NC}"
+        echo -e "8) ${YELLOW}Показать PROMO${NC}"
+        echo -e "9) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
+        echo -e "10) ${CYAN}Присвоить / изменить наименование правила${NC}"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
@@ -807,12 +1263,13 @@ show_menu() {
             1) configure_rule "udp" "AmneziaWG" ;;
             2) configure_rule "tcp" "VLESS" ;;
             3) update_target_ip ;;
-            4) list_active_rules ;;
-            5) delete_single_rule ;;
-            6) flush_rules ;;
-            7) show_promo ;;
-            8) show_instructions ;;
-            9) rename_rule ;;
+            4) groups_menu ;;
+            5) list_active_rules ;;
+            6) delete_single_rule ;;
+            7) flush_rules ;;
+            8) show_promo ;;
+            9) show_instructions ;;
+            10) rename_rule ;;
             0) exit 0 ;;
             *) ;;
         esac
