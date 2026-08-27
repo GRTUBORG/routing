@@ -12,6 +12,7 @@ NC='\033[0m'
 PROMO_MARKER_FILE='/var/lib/routing/.promo_shown'
 NAMES_FILE='/var/lib/routing/names.db'
 GROUPS_FILE='/var/lib/routing/groups.db'
+FAILOVER_LOCK_FILE='/run/routing-failover.lock'
 
 # Корректная обработка кириллицы и Backspace в интерактивном терминале.
 if LC_ALL=C.UTF-8 locale charmap >/dev/null 2>&1; then
@@ -905,6 +906,193 @@ change_rule_target_ip() {
     return 0
 }
 
+
+# --- НЕИНТЕРАКТИВНОЕ / АВТОМАТИЧЕСКОЕ ПЕРЕКЛЮЧЕНИЕ HOP ---
+# Используется watchdog'ом и может вызываться вручную:
+#   routing.sh replace-hop OLD_IP NEW_IP
+#   routing.sh replace-group GROUP OLD_IP NEW_IP
+#
+# replace-hop меняет все активные DNAT-правила, которые сейчас смотрят на OLD_IP.
+# replace-group делает то же самое, но только внутри указанной группы.
+# Перед изменениями создаётся снимок iptables и локальных БД имён/групп.
+# При любой ошибке правила откатываются целиком.
+
+ensure_failover_state() {
+    mkdir -p "$(dirname "$NAMES_FILE")" || return 1
+    touch "$NAMES_FILE" "$GROUPS_FILE" || return 1
+    chmod 600 "$NAMES_FILE" "$GROUPS_FILE" 2>/dev/null || true
+}
+
+bulk_replace_target_ip() {
+    local old_ip="$1"
+    local new_ip="$2"
+    local scope_group="${3:-}"
+    local lock_fd=9
+    local tmpdir=""
+    local iptables_snapshot=""
+    local names_snapshot=""
+    local groups_snapshot=""
+    local record
+    local port
+    local rule_index
+    local proto
+    local destination
+    local name
+    local group
+    local destination_ip
+    local success=0
+    local failed=0
+    local total=0
+    local iface
+    declare -a MATCHED_RULES=()
+
+    if ! is_valid_ipv4 "$old_ip" || ! is_valid_ipv4 "$new_ip"; then
+        echo -e "${RED}[ERROR] OLD_IP и NEW_IP должны быть корректными IPv4-адресами.${NC}" >&2
+        return 2
+    fi
+    if [[ "$old_ip" == "$new_ip" ]]; then
+        echo -e "${YELLOW}[INFO] OLD_IP и NEW_IP совпадают — переключение не требуется.${NC}"
+        return 0
+    fi
+    if [[ -n "$scope_group" && ( ${#scope_group} -gt 100 || "$scope_group" == *'|'* ) ]]; then
+        echo -e "${RED}[ERROR] Некорректное имя группы.${NC}" >&2
+        return 2
+    fi
+
+    ensure_failover_state || {
+        echo -e "${RED}[ERROR] Не удалось подготовить служебные файлы routing.${NC}" >&2
+        return 1
+    }
+
+    if ! command -v flock >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR] Не найден flock (обычно пакет util-linux).${NC}" >&2
+        return 1
+    fi
+
+    eval "exec ${lock_fd}>\"$FAILOVER_LOCK_FILE\""
+    if ! flock -n "$lock_fd"; then
+        echo -e "${RED}[ERROR] Уже выполняется другое переключение routing.${NC}" >&2
+        return 75
+    fi
+
+    iface=$(ip route get "$new_ip" 2>/dev/null | awk -- '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+    if [[ -z "$iface" ]]; then
+        echo -e "${RED}[ERROR] Нет маршрута до нового hop $new_ip.${NC}" >&2
+        return 1
+    fi
+
+    while IFS='|' read -r port rule_index proto destination name group; do
+        destination_ip="${destination%:*}"
+        [[ "$destination_ip" == "$old_ip" ]] || continue
+        if [[ -n "$scope_group" && "$group" != "$scope_group" ]]; then
+            continue
+        fi
+        MATCHED_RULES+=("$rule_index|$port|$proto|$destination|$name|$group")
+    done < <(emit_dnat_rules)
+
+    total=${#MATCHED_RULES[@]}
+    if (( total == 0 )); then
+        if [[ -n "$scope_group" ]]; then
+            echo -e "${YELLOW}[INFO] В группе '$scope_group' нет правил, направленных на $old_ip.${NC}" >&2
+        else
+            echo -e "${YELLOW}[INFO] Нет активных DNAT-правил, направленных на $old_ip.${NC}" >&2
+        fi
+        return 3
+    fi
+
+    tmpdir=$(mktemp -d /tmp/routing-failover.XXXXXX) || return 1
+    iptables_snapshot="$tmpdir/iptables.save"
+    names_snapshot="$tmpdir/names.db"
+    groups_snapshot="$tmpdir/groups.db"
+
+    if ! iptables-save > "$iptables_snapshot"; then
+        rm -rf "$tmpdir"
+        echo -e "${RED}[ERROR] Не удалось создать snapshot iptables.${NC}" >&2
+        return 1
+    fi
+    cp -a "$NAMES_FILE" "$names_snapshot" 2>/dev/null || : > "$names_snapshot"
+    cp -a "$GROUPS_FILE" "$groups_snapshot" 2>/dev/null || : > "$groups_snapshot"
+
+    if [[ -n "$scope_group" ]]; then
+        echo -e "${CYAN}[*] AUTO-SWITCH group='$scope_group': $old_ip -> $new_ip, правил: $total${NC}"
+    else
+        echo -e "${CYAN}[*] AUTO-SWITCH: $old_ip -> $new_ip, правил: $total${NC}"
+    fi
+
+    # PREROUTING здесь только заменяется через -R, поэтому индексы не сдвигаются.
+    for record in "${MATCHED_RULES[@]}"; do
+        IFS='|' read -r rule_index port proto destination name group <<< "$record"
+        if change_rule_target_ip "$rule_index" "$port" "$proto" "$destination" "$new_ip" "$name" "$group"; then
+            ((success++))
+            echo -e "${GREEN}[OK] $proto/$port: ${destination%:*} -> $new_ip${NC}"
+        else
+            ((failed++))
+            echo -e "${RED}[ERROR] $proto/$port: переключение не выполнено.${NC}" >&2
+            break
+        fi
+    done
+
+    if (( failed > 0 )); then
+        echo -e "${YELLOW}[*] Ошибка во время переключения. Выполняю rollback...${NC}" >&2
+        if iptables-restore < "$iptables_snapshot"; then
+            cp -f "$names_snapshot" "$NAMES_FILE" 2>/dev/null || true
+            cp -f "$groups_snapshot" "$GROUPS_FILE" 2>/dev/null || true
+            chmod 600 "$NAMES_FILE" "$GROUPS_FILE" 2>/dev/null || true
+            netfilter-persistent save >/dev/null 2>&1 || true
+            echo -e "${GREEN}[ROLLBACK OK] Исходные правила восстановлены.${NC}" >&2
+        else
+            echo -e "${RED}[CRITICAL] Не удалось восстановить snapshot iptables!${NC}" >&2
+        fi
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    if ! netfilter-persistent save >/dev/null; then
+        echo -e "${YELLOW}[WARNING] Переключение активно, но netfilter-persistent save завершился ошибкой.${NC}" >&2
+    fi
+
+    rm -rf "$tmpdir"
+    echo -e "${GREEN}[SUCCESS] AUTO-SWITCH завершён: $old_ip -> $new_ip, правил: $success.${NC}"
+    return 0
+}
+
+replace_hop_cli() {
+    local old_ip="${1:-}"
+    local new_ip="${2:-}"
+    if [[ -z "$old_ip" || -z "$new_ip" ]]; then
+        echo "Использование: $0 replace-hop OLD_IP NEW_IP" >&2
+        return 2
+    fi
+    bulk_replace_target_ip "$old_ip" "$new_ip"
+}
+
+replace_group_cli() {
+    local group="${1:-}"
+    local old_ip="${2:-}"
+    local new_ip="${3:-}"
+    if [[ -z "$group" || -z "$old_ip" || -z "$new_ip" ]]; then
+        echo "Использование: $0 replace-group GROUP OLD_IP NEW_IP" >&2
+        return 2
+    fi
+    bulk_replace_target_ip "$old_ip" "$new_ip" "$group"
+}
+
+cli_usage() {
+    cat <<EOF
+Неинтерактивные команды:
+  $0 replace-hop OLD_IP NEW_IP
+      Переключить ВСЕ DNAT-правила с OLD_IP на NEW_IP.
+
+  $0 replace-group GROUP OLD_IP NEW_IP
+      Переключить только правила указанной группы.
+
+Примеры:
+  $0 replace-hop 203.0.113.10 203.0.113.20
+  $0 replace-group HOP-A 203.0.113.10 203.0.113.20
+EOF
+}
+
+
 # --- УДАЛЕНИЕ ОДНОГО ПРАВИЛА ---
 delete_single_rule() {
     echo -e "\n${CYAN}--- Удаление правила ---${NC}"
@@ -1278,6 +1466,33 @@ show_menu() {
 
 # --- ЗАПУСК ---
 check_root
+
+# Неинтерактивный режим нужен watchdog'у. Он намеренно не запускает
+# prepare_system/show_promo/menu и поэтому не может зависнуть на вводе.
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        replace-hop)
+            shift
+            replace_hop_cli "$@"
+            exit $?
+            ;;
+        replace-group)
+            shift
+            replace_group_cli "$@"
+            exit $?
+            ;;
+        --help|-h|help)
+            cli_usage
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}[ERROR] Неизвестная команда: $1${NC}" >&2
+            cli_usage >&2
+            exit 2
+            ;;
+    esac
+fi
+
 prepare_system
 show_promo_once
 show_menu
