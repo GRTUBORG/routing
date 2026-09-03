@@ -923,7 +923,7 @@ ensure_failover_state() {
     chmod 600 "$NAMES_FILE" "$GROUPS_FILE" 2>/dev/null || true
 }
 
-bulk_replace_target_ip() {
+bulk_replace_target_ip() (
     local old_ip="$1"
     local new_ip="$2"
     local scope_group="${3:-}"
@@ -959,21 +959,16 @@ bulk_replace_target_ip() {
         return 2
     fi
 
-    ensure_failover_state || {
-        echo -e "${RED}[ERROR] Не удалось подготовить служебные файлы routing.${NC}" >&2
-        return 1
-    }
-
     if ! command -v flock >/dev/null 2>&1; then
-        echo -e "${RED}[ERROR] Не найден flock (обычно пакет util-linux).${NC}" >&2
+        echo '[ERROR] Нужен flock (util-linux).' >&2
         return 1
     fi
-
-    eval "exec ${lock_fd}>\"$FAILOVER_LOCK_FILE\""
-    if ! flock -n "$lock_fd"; then
-        echo -e "${RED}[ERROR] Уже выполняется другое переключение routing.${NC}" >&2
+    exec 9>"$FAILOVER_LOCK_FILE" || return 1
+    if ! flock -n 9; then
+        echo '[ERROR] routing занят (импорт/экспорт/редактирование/failover).' >&2
         return 75
     fi
+    ensure_failover_state || return 1
 
     iface=$(ip route get "$new_ip" 2>/dev/null | awk -- '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
     if [[ -z "$iface" ]]; then
@@ -1054,7 +1049,7 @@ bulk_replace_target_ip() {
     rm -rf "$tmpdir"
     echo -e "${GREEN}[SUCCESS] AUTO-SWITCH завершён: $old_ip -> $new_ip, правил: $success.${NC}"
     return 0
-}
+)
 
 replace_hop_cli() {
     local old_ip="${1:-}"
@@ -1080,6 +1075,13 @@ replace_group_cli() {
 cli_usage() {
     cat <<EOF
 Неинтерактивные команды:
+  $0 export-config FILE.tar.gz
+      Экспорт простых DNAT-маршрутов и names.db/groups.db (нужен python3).
+  $0 import-config FILE.tar.gz [--dry-run] [--no-install-deps]
+      Импорт на чистый Debian/Ubuntu second-hop; автоматический backup/rollback.
+      --dry-run: проверка без установки пакетов/изменения правил.
+      --no-install-deps: не устанавливать отсутствующие зависимости.
+
   $0 replace-hop OLD_IP NEW_IP
       Переключить ВСЕ DNAT-правила с OLD_IP на NEW_IP.
 
@@ -1443,25 +1445,579 @@ show_menu() {
         echo -e "8) ${YELLOW}Показать PROMO${NC}"
         echo -e "9) ${MAGENTA}📚 ИНСТРУКЦИЯ (Как настроить)${NC}" 
         echo -e "10) ${CYAN}Присвоить / изменить наименование правила${NC}"
+        echo -e "11) Экспорт конфигурации hop в bundle"
+        echo -e "12) Импорт конфигурации на чистый hop"
         echo -e "0) Выход"
         echo -e "------------------------------------------------------"
         read -p "Ваш выбор: " choice
 
         case $choice in
-            1) configure_rule "udp" "AmneziaWG" ;;
-            2) configure_rule "tcp" "VLESS" ;;
-            3) update_target_ip ;;
-            4) groups_menu ;;
+            1) with_routing_lock prepare_configure_rule "udp" "AmneziaWG" ;;
+            2) with_routing_lock prepare_configure_rule "tcp" "VLESS" ;;
+            3) with_routing_lock update_target_ip ;;
+            4) with_routing_lock groups_menu ;;
             5) list_active_rules ;;
-            6) delete_single_rule ;;
-            7) flush_rules ;;
+            6) with_routing_lock delete_single_rule ;;
+            7) with_routing_lock flush_rules ;;
             8) show_promo ;;
             9) show_instructions ;;
-            10) rename_rule ;;
+            10) with_routing_lock rename_rule ;;
+            11) export_config_menu ;;
+            12) import_config_menu ;;
             0) exit 0 ;;
             *) ;;
         esac
     done
+}
+
+# --- PORTABLE SECOND-HOP CONFIGURATION (bundle v1) ---
+# Shared with replace-hop/group; subshell closes the fd on every return/signal.
+with_routing_lock() (
+    command -v flock >/dev/null 2>&1 || {
+        echo '[ERROR] Нужен flock (apt-get install util-linux).' >&2
+        exit 1
+    }
+    exec 9>"$FAILOVER_LOCK_FILE" || exit 1
+    flock -n 9 || {
+        echo '[ERROR] routing занят (импорт/экспорт/редактирование/failover).' >&2
+        exit 75
+    }
+    "$@"
+)
+
+bundle_cli() {
+    with_routing_lock bundle_cli_locked "$@"
+}
+
+bundle_cli_locked() {
+    local command="${1:-}" bundle="${2:-}" arg dry=0 no_install=0
+    if [[ -z "$bundle" || "$bundle" == -* ]]; then
+        echo "Использование: $0 $command FILE.tar.gz [--dry-run] [--no-install-deps]" >&2
+        return 2
+    fi
+    for arg in "${@:3}"; do
+        case "$command:$arg" in
+            import-config:--dry-run) dry=1 ;;
+            import-config:--no-install-deps) no_install=1 ;;
+            *) echo "[ERROR] Неизвестный аргумент: $arg" >&2; return 2 ;;
+        esac
+    done
+    if ! command -v python3 >/dev/null 2>&1; then
+        if [[ "$command" != import-config || "$dry" == 1 || "$no_install" == 1 ]]; then
+            echo '[ERROR] Нужен Python 3.8+: apt-get update && apt-get install -y python3' >&2
+            return 1
+        fi
+        [[ -f "$bundle" ]] || { echo '[ERROR] Bundle не найден.' >&2; return 1; }
+        command -v apt-get >/dev/null 2>&1 || {
+            echo '[ERROR] Автоустановка поддерживает Debian/Ubuntu (apt).' >&2; return 1;
+        }
+        echo '[*] Установка Python для проверки bundle...'
+        DEBIAN_FRONTEND=noninteractive apt-get update || return 1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 || return 1
+    fi
+    python3 - "$@" <<'ROUTING_BUNDLE_PY'
+import argparse
+import hashlib
+import gzip
+import io
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+# This program is embedded in routing.sh. Bundles contain DATA ONLY.
+LIMIT = 8 * 1024 * 1024
+MEMBERS = {'manifest.json', 'routes.json', 'names.db', 'groups.db'}
+NAMES = Path('/var/lib/routing/names.db')
+GROUPS = Path('/var/lib/routing/groups.db')
+SYSCTL = Path('/etc/sysctl.d/99-z-routing-import.conf')
+PERSIST = Path('/etc/iptables/rules.v4')
+
+def fail(message):
+    raise ValueError(message)
+
+def run(*args, input=None):
+    p = subprocess.run(args, input=input, text=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, check=False)
+    if p.returncode:
+        fail('{}: {}'.format(shlex.join(args), p.stderr.strip() or p.stdout.strip()))
+    return p.stdout
+
+def valid_port(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[1-9][0-9]{0,4}', value):
+        fail('Некорректный порт')
+    if int(value) > 65535:
+        fail('Порт больше 65535')
+    return value
+
+def valid_ip(value):
+    if not isinstance(value, str):
+        fail('IPv4 должен быть строкой')
+    ip = ipaddress.IPv4Address(value)
+    if ip.is_unspecified or ip.is_multicast or ip.is_loopback or str(ip) == '255.255.255.255':
+        fail('Недопустимый destination IP: ' + str(ip))
+    return str(ip)
+
+def label(value, maximum=512):
+    if not isinstance(value, str) or len(value) > maximum:
+        fail('Некорректные метаданные')
+    if any(ord(c) < 32 or ord(c) == 127 or c == '|' for c in value):
+        fail('Управляющий символ или | в метаданных')
+    return value
+
+def validate_routes(routes):
+    if not isinstance(routes, list) or not 1 <= len(routes) <= 10000:
+        fail('Bundle должен содержать от 1 до 10000 маршрутов')
+    seen = set()
+    for r in routes:
+        if not isinstance(r, dict) or set(r) != {'proto', 'in_port', 'ip', 'out_port'}:
+            fail('Неизвестные поля маршрута')
+        if r['proto'] not in ('tcp', 'udp'):
+            fail('Поддерживаются только TCP/UDP')
+        valid_port(r['in_port']); valid_port(r['out_port']); valid_ip(r['ip'])
+        key = (r['proto'], r['in_port'])
+        if key in seen:
+            fail('Повторяющийся входной порт: ' + str(key))
+        seen.add(key)
+    return routes
+
+def route_key(r):
+    return (r['proto'], r['in_port'], r['ip'] + ':' + r['out_port'])
+
+def read_db(raw, maximum=512):
+    result = {}
+    if any(b < 32 and b != 10 or b == 127 for b in raw):
+        fail('Управляющий символ в БД метаданных')
+    for line in raw.decode('utf-8').splitlines():
+        if not line:
+            continue
+        fields = line.split('|')
+        if len(fields) != 4:
+            fail('Некорректная строка names.db/groups.db')
+        proto, port, dest, value = fields
+        if proto not in ('tcp', 'udp') or ':' not in dest:
+            fail('Некорректный ключ метаданных')
+        ip, out_port = dest.split(':', 1)
+        valid_port(port); valid_ip(ip); valid_port(out_port); label(value, maximum)
+        key = (proto, port, dest)
+        if key in result:
+            fail('Повторяющийся ключ метаданных')
+        result[key] = value
+    return result
+
+def db_bytes(routes, values):
+    return ''.join('|'.join((*route_key(r), values[route_key(r)])) + '\n'
+                   for r in routes if values.get(route_key(r))).encode('utf-8')
+
+def parse_source(snapshot):
+    routes, comments, table = [], {}, ''
+    for line in snapshot.splitlines():
+        if line.startswith('*'):
+            table = line[1:]
+        if table != 'nat' or not line.startswith('-A PREROUTING '):
+            continue
+        tokens = shlex.split(line)
+        fields, modules = {}, []
+        i = 2
+        while i < len(tokens):
+            key = tokens[i]
+            if i + 1 >= len(tokens):
+                fail('Неподдерживаемое PREROUTING правило: ' + line)
+            value = tokens[i + 1]
+            if key == '-m':
+                modules.append(value)
+            elif key in ('-p', '--dport', '-j', '--to-destination', '--comment') and key not in fields:
+                fields[key] = value
+            else:
+                fail('Экспорт остановлен: нестандартное PREROUTING правило: ' + line)
+            i += 2
+        required = {'-p', '--dport', '-j', '--to-destination'}
+        if not required <= fields.keys() or fields['-j'] != 'DNAT':
+            fail('Экспорт поддерживает только простые DNAT правила routing.sh: ' + line)
+        if any(m not in (fields['-p'], 'comment') for m in modules):
+            fail('Неподдерживаемый match module: ' + line)
+        dest = fields['--to-destination'].split(':')
+        if len(dest) != 2:
+            fail('Нужен одиночный IPv4:port: ' + line)
+        r = dict(proto=fields['-p'], in_port=fields['--dport'], ip=dest[0], out_port=dest[1])
+        routes.append(r)
+        comment = fields.get('--comment', '')
+        if comment and not comment.startswith('routing:'):
+            fail('Чужой comment в DNAT: ' + line)
+        if comment:
+            comments[route_key(r)] = label(comment[len('routing:'):])
+    return validate_routes(routes), comments
+
+def snapshot():
+    # Instantiate these tables before taking a complete, rollback-capable snapshot.
+    run('iptables', '-w', '10', '-t', 'nat', '-S')
+    run('iptables', '-w', '10', '-t', 'filter', '-S')
+    return run('iptables-save')
+
+def clean_target(text):
+    table = ''
+    for line in text.splitlines():
+        if line.startswith('*'):
+            table = line[1:]
+        if line.startswith('-A ') and (table != 'filter' or line.startswith('-A FORWARD ')):
+            fail('Импорт разрешён на чистый hop: найдены правила NAT/FORWARD/raw/mangle/security. '
+                 'Автоматического удаления или merge нет.')
+    for path in (NAMES, GROUPS):
+        if path.exists() and path.stat().st_size:
+            fail('На целевом сервере уже есть метаданные: ' + str(path))
+
+def json_bytes(obj):
+    return (json.dumps(obj, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+
+def export_bundle(path):
+    saved = snapshot()
+    routes, comments = parse_source(saved)
+    names = read_db(NAMES.read_bytes()) if NAMES.exists() else {}
+    groups = read_db(GROUPS.read_bytes(), 100) if GROUPS.exists() else {}
+    for key, value in comments.items():
+        if not names.get(key):
+            names[key] = value
+    payload = {'routes.json': json_bytes(routes), 'names.db': db_bytes(routes, names),
+               'groups.db': db_bytes(routes, groups)}
+    manifest = {'format': 'routing-hop', 'version': 1,
+                'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'count': len(routes), 'sha256': {k: hashlib.sha256(v).hexdigest() for k, v in payload.items()}}
+    payload['manifest.json'] = json_bytes(manifest)
+    path = Path(path).absolute()
+    if path.exists() or path.is_symlink():
+        fail('Файл уже существует; выберите новое имя: ' + str(path))
+    # Exclusive creation; never overwrite an earlier export, including via symlink.
+    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as stream, tarfile.open(fileobj=stream, mode='w:gz') as tar:
+            for name, data in payload.items():
+                entry = tarfile.TarInfo(name)
+                entry.size, entry.mode, entry.mtime = len(data), 0o600, int(time.time())
+                tar.addfile(entry, io.BytesIO(data))
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    print('[OK] Bundle: {} ({} правил)'.format(path, len(routes)))
+    print('SHA256: ' + hashlib.sha256(path.read_bytes()).hexdigest())
+    print('INPUT/OUTPUT, чужие FORWARD, sysctl, интерфейсы и watchdog-state в bundle не входят.')
+
+def no_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail('Повторяющийся JSON-ключ')
+        result[key] = value
+    return result
+
+def load_bundle(path):
+    payload, total = {}, 0
+    if Path(path).stat().st_size > LIMIT:
+        fail('Сжатый bundle слишком большой')
+    with gzip.open(path, 'rb') as stream:
+        raw = stream.read(LIMIT + 65537)
+    if len(raw) > LIMIT + 65536:
+        fail('Распакованный bundle слишком большой')
+    # No extract/extractall: paths, links, ownership and archive permissions never touch disk.
+    with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as tar:
+        for entry in tar:
+            if entry.name not in MEMBERS or entry.name in payload or not entry.isfile():
+                fail('Неизвестный/повторный файл или ссылка в bundle')
+            total += entry.size
+            if entry.size < 0 or total > LIMIT:
+                fail('Bundle слишком большой (лимит 8 MiB без сжатия)')
+            payload[entry.name] = tar.extractfile(entry).read(entry.size + 1)
+    if set(payload) != MEMBERS:
+        fail('Неполный bundle')
+    manifest = json.loads(payload['manifest.json'], object_pairs_hook=no_duplicate_keys)
+    if (not isinstance(manifest, dict) or manifest.get('format') != 'routing-hop'
+            or type(manifest.get('version')) is not int or manifest['version'] != 1):
+        fail('Неизвестная версия bundle')
+    hashes = manifest.get('sha256')
+    if not isinstance(hashes, dict) or set(hashes) != MEMBERS - {'manifest.json'}:
+        fail('Некорректный manifest')
+    for name, checksum in hashes.items():
+        if hashlib.sha256(payload[name]).hexdigest() != checksum:
+            fail('SHA256 не совпадает: ' + name)
+    routes = validate_routes(json.loads(payload['routes.json'], object_pairs_hook=no_duplicate_keys))
+    if type(manifest.get('count')) is not int or manifest['count'] != len(routes):
+        fail('Количество правил не совпадает')
+    keys = {route_key(r) for r in routes}
+    for name, maximum in [('names.db', 512), ('groups.db', 100)]:
+        db = read_db(payload[name], maximum)
+        if not db.keys() <= keys:
+            fail('Метаданные ссылаются на отсутствующий маршрут')
+        payload[name] = db_bytes(routes, db)
+    return routes, payload
+
+def generate_plan(routes):
+    nat, forward, destinations = [], [], {}
+    for r in routes:
+        proto, port, ip, out = r['proto'], r['in_port'], r['ip'], r['out_port']
+        route = json.loads(run('ip', '-j', '-4', 'route', 'get', ip))
+        if not route or route[0].get('type', 'unicast') != 'unicast':
+            fail('Нет unicast-маршрута до ' + ip)
+        iface = route[0].get('dev', '')
+        if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,15}', iface) or iface == 'lo':
+            fail('Некорректный egress-интерфейс для ' + ip)
+        destinations[ip] = iface
+        nat.append('-A PREROUTING -p {} --dport {} -j DNAT --to-destination {}:{}'.format(proto, port, ip, out))
+        # Keep original routing.sh FORWARD/MASQUERADE shape so replace-hop/group remain compatible.
+        for rule in [
+            '-A FORWARD -p {} -d {} --dport {} -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT'.format(proto, ip, out),
+            '-A FORWARD -p {} -s {} --sport {} -m state --state ESTABLISHED,RELATED -j ACCEPT'.format(proto, ip, out)]:
+            # One pair per route, including shared destinations: the existing
+            # replace/delete functions remove exactly one pair for each DNAT.
+            forward.append(rule)
+    for iface in sorted(set(destinations.values())):
+        nat.append('-A POSTROUTING -o {} -j MASQUERADE'.format(iface))
+    return '*nat\n' + '\n'.join(nat) + '\nCOMMIT\n*filter\n' + '\n'.join(forward) + '\nCOMMIT\n', destinations
+
+def atomic_write(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        fail('Отказ писать через ссылку/специальный файл: ' + str(path))
+    fd, temp = tempfile.mkstemp(prefix='.' + path.name, dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+def check_managers():
+    if not Path('/run/systemd/system').is_dir():
+        fail('Автоимпорт поддерживает Debian/Ubuntu с systemd')
+    for service in ('ufw', 'firewalld', 'docker', 'nftables', 'hop-watchdog'):
+        p = subprocess.run(['systemctl', 'is-active', '--quiet', service], check=False)
+        if p.returncode == 0:
+            fail('Сначала остановите конфликтующий сервис: ' + service)
+
+def install_dependencies(allowed):
+    packages = ('iptables', 'iproute2', 'procps', 'conntrack', 'iptables-persistent', 'netfilter-persistent')
+    missing = []
+    for package in packages:
+        p = subprocess.run(['dpkg-query', '-W', '-f=${Status}', package],
+                           text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if p.returncode or p.stdout != 'install ok installed':
+            missing.append(package)
+    if not missing:
+        return
+    if not allowed:
+        fail('Нужны пакеты: ' + ' '.join(missing))
+    policy = Path('/usr/sbin/policy-rc.d')
+    if policy.exists() or policy.is_symlink():
+        fail('Найдена policy-rc.d: установите зависимости самостоятельно: ' + ' '.join(missing))
+    # Do not allow package postinst to restore old rules or start/restart services.
+    fd = os.open(str(policy), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write('#!/bin/sh\nexit 101\n')
+        os.chmod(policy, 0o755)
+        env = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
+        subprocess.run(['debconf-set-selections'], input=(
+            'iptables-persistent iptables-persistent/autosave_v4 boolean false\n'
+            'iptables-persistent iptables-persistent/autosave_v6 boolean false\n'),
+            text=True, check=True, env=env)
+        subprocess.run(['apt-get', 'update'], check=True, env=env)
+        subprocess.run(['apt-get', 'install', '-y', '--no-install-recommends', *missing], check=True, env=env)
+    finally:
+        policy.unlink()
+
+def save_backup(before):
+    root = Path('/var/backups/routing-import')
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix=time.strftime('%Y%m%d-%H%M%S-'), dir=str(root)))
+    atomic_write(backup / 'iptables.save', before.encode())
+    state = []
+    for number, path in enumerate((NAMES, GROUPS, SYSCTL, PERSIST)):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            fail('Нестандартный целевой файл: ' + str(path))
+        entry = {'path': str(path), 'existed': path.exists(), 'file': str(number)}
+        if path.exists():
+            st = path.stat()
+            entry.update(mode=st.st_mode & 0o777, uid=st.st_uid, gid=st.st_gid)
+            atomic_write(backup / str(number), path.read_bytes())
+        state.append(entry)
+    atomic_write(backup / 'files.json', json_bytes(state))
+    atomic_write(backup / 'ip_forward', run('sysctl', '-n', 'net.ipv4.ip_forward').encode())
+    return backup, state
+
+def restore_backup(backup, state):
+    errors = []
+    # Attempt EVERY rollback part even if an earlier part fails.
+    operations = [lambda: run('iptables-restore', '-w', '10', input=(backup / 'iptables.save').read_text()),
+                  lambda: run('sysctl', '-w', 'net.ipv4.ip_forward=' + (backup / 'ip_forward').read_text().strip())]
+    def restore_file(entry):
+        path = Path(entry['path'])
+        if entry['existed']:
+            atomic_write(path, (backup / entry['file']).read_bytes())
+            os.chmod(path, entry['mode']); os.chown(path, entry['uid'], entry['gid'])
+        else:
+            path.unlink(missing_ok=True)
+    operations.extend(lambda e=e: restore_file(e) for e in state)
+    for operation in operations:
+        try:
+            operation()
+        except BaseException as exc:
+            errors.append(str(exc))
+    if errors:
+        print('[CRITICAL] Ошибки rollback: ' + '; '.join(errors), file=sys.stderr)
+    else:
+        print('[ROLLBACK OK] Правила, файлы и ip_forward восстановлены.', file=sys.stderr)
+
+def verify_routes(routes):
+    for r in routes:
+        p, port, ip, out = r['proto'], r['in_port'], r['ip'], r['out_port']
+        run('iptables', '-w', '10', '-t', 'nat', '-C', 'PREROUTING', '-p', p, '--dport', port,
+            '-j', 'DNAT', '--to-destination', ip + ':' + out)
+        run('iptables', '-w', '10', '-C', 'FORWARD', '-p', p, '-d', ip, '--dport', out,
+            '-m', 'state', '--state', 'NEW,ESTABLISHED,RELATED', '-j', 'ACCEPT')
+        run('iptables', '-w', '10', '-C', 'FORWARD', '-p', p, '-s', ip, '--sport', out,
+            '-m', 'state', '--state', 'ESTABLISHED,RELATED', '-j', 'ACCEPT')
+
+def input_output_rules(text):
+    table, result = '', []
+    for line in text.splitlines():
+        if line.startswith('*'):
+            table = line
+        if re.match(r'^(?:-A |:)(?:INPUT|OUTPUT)(?: |$)', line):
+            result.append((table, re.sub(r'\[[0-9]+:[0-9]+\]', '[0:0]', line)))
+    return result
+
+def import_bundle(args):
+    routes, payload = load_bundle(args.bundle)
+    print('[OK] Bundle проверен: {} правил'.format(len(routes)), flush=True)
+    if args.dry_run:
+        for r in routes:
+            print('{} {} -> {}:{}'.format(r['proto'], r['in_port'], r['ip'], r['out_port']))
+        missing = [x for x in ('iptables', 'iptables-save', 'iptables-restore', 'ip', 'sysctl') if not shutil.which(x)]
+        if missing:
+            fail('Bundle корректен; проверка хоста не завершена, нужны: ' + ', '.join(missing))
+        check_managers()
+        clean_target(snapshot())
+        plan, destinations = generate_plan(routes)
+        run('iptables-restore', '-w', '10', '--test', '--noflush', input=plan)
+        print(plan)
+        print('[DRY-RUN OK] Системные настройки/пакеты/правила не изменены.')
+        return
+    if not shutil.which('apt-get') or not shutil.which('dpkg-query'):
+        fail('Автоимпорт поддерживает Debian/Ubuntu (apt)')
+    check_managers()
+    if shutil.which('iptables-save') and shutil.which('iptables'):
+        clean_target(snapshot())
+    install_dependencies(not args.no_install_deps)
+    before = snapshot()
+    clean_target(before)
+    plan, destinations = generate_plan(routes)
+    run('iptables-restore', '-w', '10', '--test', '--noflush', input=plan)
+    backup, state = save_backup(before)
+    enabled = subprocess.run(['systemctl', 'is-enabled', 'netfilter-persistent.service'],
+                             text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout.strip()
+    if enabled not in ('enabled', 'disabled'):
+        fail('Неожиданное состояние netfilter-persistent: ' + enabled)
+    atomic_write(backup / 'service-enabled', (enabled + '\n').encode())
+    atomic_write(backup / 'import.rules', plan.encode())
+    print('[BACKUP] ' + str(backup), flush=True)
+    try:
+        # No chain declarations, no policies, no flush: existing INPUT/OUTPUT are retained.
+        run('iptables-restore', '-w', '10', '--noflush', input=plan)
+        atomic_write(NAMES, payload['names.db'])
+        atomic_write(GROUPS, payload['groups.db'])
+        atomic_write(SYSCTL, b'# routing.sh import: only the required routing setting\nnet.ipv4.ip_forward=1\n')
+        run('sysctl', '-w', 'net.ipv4.ip_forward=1')
+        verify_routes(routes)
+        for iface in set(destinations.values()):
+            run('iptables', '-w', '10', '-t', 'nat', '-C', 'POSTROUTING', '-o', iface, '-j', 'MASQUERADE')
+        after = snapshot()
+        if input_output_rules(before) != input_output_rules(after):
+            fail('INPUT/OUTPUT изменились во время импорта')
+        if run('sysctl', '-n', 'net.ipv4.ip_forward').strip() != '1':
+            fail('Не удалось включить forwarding')
+        atomic_write(PERSIST, after.encode())
+        run('iptables-restore', '-w', '10', '--test', input=PERSIST.read_text())
+        run('systemctl', 'enable', 'netfilter-persistent.service')
+        print('[SUCCESS] Импорт завершён; правила сохранены для загрузки через netfilter-persistent.')
+        print('Проверьте реальный трафик через новый hop, затем добавьте его в standby на ingress.')
+    except BaseException:
+        # Prevent a second Ctrl-C/SIGTERM from aborting rollback.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        restore_backup(backup, state)
+        if enabled == 'disabled':
+            try:
+                run('systemctl', 'disable', 'netfilter-persistent.service')
+            except Exception as exc:
+                print('[CRITICAL] Не удалось восстановить enable-state: ' + str(exc), file=sys.stderr)
+        raise
+
+def main():
+    parser = argparse.ArgumentParser(description='Перенос конфигурации routing.sh на чистый second-hop')
+    sub = parser.add_subparsers(dest='command', required=True)
+    export = sub.add_parser('export-config')
+    export.add_argument('bundle')
+    imp = sub.add_parser('import-config')
+    imp.add_argument('bundle')
+    imp.add_argument('--dry-run', action='store_true')
+    imp.add_argument('--no-install-deps', action='store_true')
+    args = parser.parse_args()
+    def interrupted(signum, frame):
+        raise InterruptedError('Получен сигнал ' + str(signum))
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+    os.umask(0o077)
+    try:
+        if args.command == 'export-config':
+            export_bundle(args.bundle)
+        else:
+            import_bundle(args)
+    except (Exception, KeyboardInterrupt) as exc:
+        print('[ERROR] ' + str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
+ROUTING_BUNDLE_PY
+}
+
+export_config_menu() {
+    local bundle
+    read -r -p 'Файл bundle [/root/hop-config.tar.gz]: ' bundle
+    bundle_cli export-config "${bundle:-/root/hop-config.tar.gz}"
+    read -r -p 'Нажмите Enter...'
+}
+
+import_config_menu() {
+    local bundle answer
+    read -r -p 'Путь к bundle: ' bundle
+    [[ -n "$bundle" ]] || return
+    echo 'Сначала проверка bundle и чистоты сервера (нужны Python и iptables).'
+    if ! bundle_cli import-config "$bundle" --dry-run; then
+        echo 'Предварительная проверка не завершена. Импорт повторит проверки;'
+        echo 'недостающие зависимости будут установлены, конфликтующие правила приведут к отказу.'
+    fi
+    read -r -p 'Запустить импорт? Введите IMPORT: ' answer
+    if [[ "$answer" == IMPORT ]]; then
+        bundle_cli import-config "$bundle"
+    fi
+    read -r -p 'Нажмите Enter...'
+}
+
+prepare_configure_rule() {
+    prepare_system || return 1
+    configure_rule "$@"
 }
 
 # --- ЗАПУСК ---
@@ -1471,6 +2027,10 @@ check_root
 # prepare_system/show_promo/menu и поэтому не может зависнуть на вводе.
 if [[ $# -gt 0 ]]; then
     case "$1" in
+        export-config|import-config)
+            bundle_cli "$@"
+            exit $?
+            ;;
         replace-hop)
             shift
             replace_hop_cli "$@"
@@ -1493,6 +2053,6 @@ if [[ $# -gt 0 ]]; then
     esac
 fi
 
-prepare_system
+# System preparation runs when adding a route; export/import have their own checks.
 show_promo_once
 show_menu
