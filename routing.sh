@@ -1083,6 +1083,8 @@ cli_usage() {
       --no-install-deps: не устанавливать отсутствующие зависимости.
   $0 import-metadata FILE.tar.gz [--dry-run]
       Восстановить только имена/группы для существующих маршрутов, без изменения firewall.
+  $0 refresh-conntrack FILE.tar.gz [--udp-only] [--dry-run]
+      Проверить существующие маршруты и сбросить conntrack только их входящих портов.
 
   $0 replace-hop OLD_IP NEW_IP
       Переключить ВСЕ DNAT-правила с OLD_IP на NEW_IP.
@@ -1499,7 +1501,8 @@ bundle_cli_locked() {
     fi
     for arg in "${@:3}"; do
         case "$command:$arg" in
-            import-config:--dry-run|import-metadata:--dry-run) dry=1 ;;
+            import-config:--dry-run|import-metadata:--dry-run|refresh-conntrack:--dry-run) dry=1 ;;
+            refresh-conntrack:--udp-only) ;;
             import-config:--no-install-deps) no_install=1 ;;
             *) echo "[ERROR] Неизвестный аргумент: $arg" >&2; return 2 ;;
         esac
@@ -1964,6 +1967,61 @@ def verify_metadata(payload):
         if not path.is_file() or path.read_bytes() != payload[name]:
             fail('Не удалось проверить записанные метаданные: ' + str(path))
 
+def clear_conntrack(routes):
+    # Match configure_rule(): flush OLD flow state by original incoming port,
+    # not by the translated destination port. Existing UDP can keep a cached
+    # NAT/no-NAT binding even after the new iptables rules are installed.
+    # Never flush the whole conntrack table. Restrict this to IPv4 TCP/UDP ports
+    # included in the imported routes; as in manual setup, clients may reconnect.
+    errors, seen = [], set()
+    env = dict(os.environ, LC_ALL='C', LANG='C')
+    for route in routes:
+        key = (route['proto'], route['in_port'])
+        if key in seen:
+            continue
+        seen.add(key)
+        selectors = ['-f', 'ipv4', '-p', key[0], '--dport', key[1]]
+        deleted = subprocess.run(['conntrack', '-D', *selectors], text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        if deleted.returncode == 0:
+            continue
+        # conntrack also returns 1 when nothing matched. Do not confuse that
+        # with EPERM/kernel errors: a successful empty read confirms no old flow.
+        if deleted.returncode == 1:
+            remaining = subprocess.run(['conntrack', '-L', *selectors], text=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            if remaining.returncode == 0 and not remaining.stdout.strip():
+                continue
+        errors.append('{}/{}: {}'.format(key[0], key[1], deleted.stderr.strip() or 'rc=' + str(deleted.returncode)))
+    if errors:
+        fail('Очистка conntrack не завершена. Она не изменяла правила и метаданные. '
+             'Полный импорт повторять не нужно. Ошибки:\n' + '\n'.join(errors))
+    print('[OK] Conntrack обработан для {} импортированных TCP/UDP-портов.'.format(len(seen)))
+
+def refresh_conntrack(args):
+    routes, _ = load_bundle(args.bundle)
+    if args.udp_only:
+        routes = [r for r in routes if r['proto'] == 'udp']
+    if not routes:
+        fail('В bundle нет выбранных маршрутов.')
+    active, _ = parse_source(run('iptables-save', '-t', 'nat'))
+    missing = {route_key(r) for r in routes} - {route_key(r) for r in active}
+    if missing:
+        fail('Сначала нужно восстановить сами DNAT-правила. Conntrack не изменён. Отсутствуют:\n' +
+             '\n'.join('  ' + '|'.join(key) for key in sorted(missing)[:5]))
+    verify_routes(routes)
+    _, destinations = generate_plan(routes)
+    for iface in set(destinations.values()):
+        run('iptables', '-w', '10', '-t', 'nat', '-C', 'POSTROUTING', '-o', iface, '-j', 'MASQUERADE')
+    if run('sysctl', '-n', 'net.ipv4.ip_forward').strip() != '1':
+        fail('IPv4 forwarding выключен; conntrack не изменён.')
+    print('[OK] Проверены DNAT/FORWARD/MASQUERADE и forwarding; выбранных маршрутов: {}'.format(len(routes)))
+    if args.dry_run:
+        print('[DRY-RUN OK] Conntrack, правила и метаданные не изменены.')
+        return
+    clear_conntrack(routes)
+    print('[SUCCESS] Состояние соединений обновлено. Проверьте трафик клиента.')
+
 def import_metadata(args):
     routes, payload = load_bundle(args.bundle)
     names_count, groups_count = metadata_counts(payload)
@@ -2097,9 +2155,6 @@ def import_bundle(args):
         run('iptables-restore', '-w', '10', '--test', input=PERSIST.read_text())
         run('systemctl', 'enable', 'netfilter-persistent.service')
         verify_metadata(payload)
-        print('[SUCCESS] Импорт завершён; правила сохранены для загрузки через netfilter-persistent.')
-        print('[OK] Записано и проверено: имён {}, назначений групп {}.'.format(names_count, groups_count))
-        print('Проверьте реальный трафик через новый hop, затем добавьте его в standby на ingress.')
     except BaseException:
         # Prevent a second Ctrl-C/SIGTERM from aborting rollback.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -2112,6 +2167,14 @@ def import_bundle(args):
             except Exception as exc:
                 print('[CRITICAL] Не удалось восстановить enable-state: ' + str(exc), file=sys.stderr)
         raise
+    # Commit configuration BEFORE invalidating flow state, which cannot be
+    # restored by an iptables snapshot. An error here must not undo valid rules
+    # or remove metadata; report explicitly that configuration is already saved.
+    print('[APPLIED] Правила и метаданные проверены и сохранены; обновляю conntrack.', flush=True)
+    clear_conntrack(routes)
+    print('[SUCCESS] Импорт завершён; правила сохранены для загрузки через netfilter-persistent.')
+    print('[OK] Записано и проверено: имён {}, назначений групп {}.'.format(names_count, groups_count))
+    print('Проверьте реальный трафик через новый hop, затем добавьте его в standby на ingress.')
 
 def main():
     parser = argparse.ArgumentParser(description='Перенос конфигурации routing.sh на чистый second-hop')
@@ -2125,6 +2188,10 @@ def main():
     meta = sub.add_parser('import-metadata', help='Восстановить имена и группы для существующих маршрутов')
     meta.add_argument('bundle')
     meta.add_argument('--dry-run', action='store_true')
+    refresh = sub.add_parser('refresh-conntrack', help='Обновить conntrack для существующих маршрутов из bundle')
+    refresh.add_argument('bundle')
+    refresh.add_argument('--dry-run', action='store_true')
+    refresh.add_argument('--udp-only', action='store_true')
     args = parser.parse_args()
     def interrupted(signum, frame):
         raise InterruptedError('Получен сигнал ' + str(signum))
@@ -2136,6 +2203,8 @@ def main():
             export_bundle(args.bundle)
         elif args.command == 'import-metadata':
             import_metadata(args)
+        elif args.command == 'refresh-conntrack':
+            refresh_conntrack(args)
         else:
             import_bundle(args)
     except (Exception, KeyboardInterrupt) as exc:
@@ -2183,7 +2252,7 @@ check_root
 # prepare_system/show_promo/menu и поэтому не может зависнуть на вводе.
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        export-config|import-config|import-metadata)
+        export-config|import-config|import-metadata|refresh-conntrack)
             bundle_cli "$@"
             exit $?
             ;;
