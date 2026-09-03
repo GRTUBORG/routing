@@ -1665,12 +1665,45 @@ def snapshot():
 
 def clean_target(text):
     table = ''
+    conflicts = []
+    chains, populated, rules = {}, set(), []
+    # Disabled UFW can leave unconditional FORWARD jumps to empty user chains.
+    # Read the entire table before deciding: a target may have rules later in
+    # iptables-save. Only the six known hooks below are eligible, never -g,
+    # conditional jumps, undeclared chains, or chains containing any rule.
+    ufw_forward_hooks = {
+        'ufw-before-logging-forward', 'ufw-before-forward',
+        'ufw-after-forward', 'ufw-after-logging-forward',
+        'ufw-reject-forward', 'ufw-track-forward',
+    }
     for line in text.splitlines():
         if line.startswith('*'):
             table = line[1:]
-        if line.startswith('-A ') and (table != 'filter' or line.startswith('-A FORWARD ')):
-            fail('Импорт разрешён на чистый hop: найдены правила NAT/FORWARD/raw/mangle/security. '
-                 'Автоматического удаления или merge нет.')
+        elif line.startswith(':'):
+            fields = line[1:].split()
+            if len(fields) >= 2:
+                chains[(table, fields[0])] = fields[1]
+        elif line.startswith('-A '):
+            tokens = shlex.split(line)
+            populated.add((table, tokens[1]))
+            rules.append((table, line, tokens))
+    for table, line, tokens in rules:
+        if table == 'filter' and tokens[1] == 'FORWARD':
+            if (len(tokens) == 4 and tokens[2] == '-j'
+                    and tokens[3] in ufw_forward_hooks
+                    and chains.get(('filter', tokens[3])) == '-'
+                    and ('filter', tokens[3]) not in populated):
+                continue
+        if table != 'filter' or tokens[1] == 'FORWARD':
+            conflicts.append((table, line))
+    if conflicts:
+        details = '\n'.join('  [{}] {}'.format(table, rule) for table, rule in conflicts[:12])
+        if len(conflicts) > 12:
+            details += '\n  ... ещё {} правил'.format(len(conflicts) - 12)
+        fail('Импорт остановлен: найдены существующие правила ({}) в проверяемых цепочках.\n'
+             '{}\nПустые цепочки и стандартные политики сами по себе не мешают импорту.\n'
+             'Для диагностики выполните iptables-save. Правила не удалены и не изменены.'
+             .format(len(conflicts), details))
     for path in (NAMES, GROUPS):
         if path.exists() and path.stat().st_size:
             fail('На целевом сервере уже есть метаданные: ' + str(path))
