@@ -1081,6 +1081,8 @@ cli_usage() {
       Импорт на чистый Debian/Ubuntu second-hop; автоматический backup/rollback.
       --dry-run: проверка без установки пакетов/изменения правил.
       --no-install-deps: не устанавливать отсутствующие зависимости.
+  $0 import-metadata FILE.tar.gz [--dry-run]
+      Восстановить только имена/группы для существующих маршрутов, без изменения firewall.
 
   $0 replace-hop OLD_IP NEW_IP
       Переключить ВСЕ DNAT-правила с OLD_IP на NEW_IP.
@@ -1497,7 +1499,7 @@ bundle_cli_locked() {
     fi
     for arg in "${@:3}"; do
         case "$command:$arg" in
-            import-config:--dry-run) dry=1 ;;
+            import-config:--dry-run|import-metadata:--dry-run) dry=1 ;;
             import-config:--no-install-deps) no_install=1 ;;
             *) echo "[ERROR] Неизвестный аргумент: $arg" >&2; return 2 ;;
         esac
@@ -1541,6 +1543,7 @@ NAMES = Path('/var/lib/routing/names.db')
 GROUPS = Path('/var/lib/routing/groups.db')
 SYSCTL = Path('/etc/sysctl.d/99-z-routing-import.conf')
 PERSIST = Path('/etc/iptables/rules.v4')
+METADATA_BACKUPS = Path('/var/backups/routing-metadata')
 
 def fail(message):
     raise ValueError(message)
@@ -1953,9 +1956,97 @@ def input_output_rules(text):
             result.append((table, re.sub(r'\[[0-9]+:[0-9]+\]', '[0:0]', line)))
     return result
 
+def metadata_counts(payload):
+    return (len(read_db(payload['names.db'])), len(read_db(payload['groups.db'], 100)))
+
+def verify_metadata(payload):
+    for path, name in ((NAMES, 'names.db'), (GROUPS, 'groups.db')):
+        if not path.is_file() or path.read_bytes() != payload[name]:
+            fail('Не удалось проверить записанные метаданные: ' + str(path))
+
+def import_metadata(args):
+    routes, payload = load_bundle(args.bundle)
+    names_count, groups_count = metadata_counts(payload)
+    print('[OK] Bundle: {} маршрутов, имён: {}, назначений групп: {}'.format(
+        len(routes), names_count, groups_count), flush=True)
+    if not names_count and not groups_count:
+        fail('В bundle нет имён и групп для восстановления.')
+    # Read only. Never run iptables-restore, install dependencies, or touch sysctl.
+    live = run('iptables-save', '-t', 'nat')
+    if not any(line.startswith('-A PREROUTING ') for line in live.splitlines()):
+        fail('На сервере нет DNAT-маршрутов. Сначала нужен полный import-config; '
+             'проверка bundle сама по себе не означает успешный импорт.')
+    active, _ = parse_source(live)
+    missing = {route_key(r) for r in routes} - {route_key(r) for r in active}
+    if missing:
+        fail('Маршруты сервера не совпадают с bundle. Метаданные не изменены. Отсутствуют:\n' +
+             '\n'.join('  ' + '|'.join(key) for key in sorted(missing)[:5]))
+    changes = []
+    for path, name, maximum in ((NAMES, 'names.db', 512), (GROUPS, 'groups.db', 100)):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            fail('Нестандартный файл метаданных: ' + str(path))
+        original = path.read_bytes() if path.exists() else None
+        current = read_db(original, maximum) if original is not None else {}
+        incoming = read_db(payload[name], maximum)
+        merged = dict(current)
+        for key, value in incoming.items():
+            if current.get(key) and current[key] != value:
+                fail('Уже задано другое имя/группа в {} для {}. Перезаписи нет.'.format(name, '|'.join(key)))
+            merged[key] = value
+        if merged != current:
+            data = ''.join('|'.join((*key, value)) + '\n' for key, value in merged.items()).encode('utf-8')
+            changes.append((path, original, data))
+    if args.dry_run:
+        print('[DRY-RUN OK] Маршруты совпадают. Будет обновлено файлов: {}. Правила не меняются.'.format(len(changes)))
+        return
+    if not changes:
+        print('[OK] Имена и группы из bundle уже сохранены. Изменений нет.')
+        return
+    METADATA_BACKUPS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix=time.strftime('%Y%m%d-%H%M%S-'), dir=str(METADATA_BACKUPS)))
+    state = []
+    for path, original, data in changes:
+        entry = {'path': str(path), 'file': path.name, 'existed': original is not None}
+        if original is not None:
+            stat = path.stat()
+            entry.update(mode=stat.st_mode & 0o777, uid=stat.st_uid, gid=stat.st_gid)
+            atomic_write(backup / path.name, original)
+        state.append(entry)
+    atomic_write(backup / 'files.json', json_bytes(state))
+    print('[BACKUP] ' + str(backup), flush=True)
+    try:
+        for path, original, data in changes:
+            atomic_write(path, data)
+        for path, original, data in changes:
+            if path.read_bytes() != data:
+                fail('Ошибка проверки записанного файла: ' + str(path))
+    except BaseException:
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_IGN)
+        errors = []
+        for entry in state:
+            try:
+                path = Path(entry['path'])
+                if entry['existed']:
+                    atomic_write(path, (backup / entry['file']).read_bytes())
+                    os.chmod(path, entry['mode']); os.chown(path, entry['uid'], entry['gid'])
+                else:
+                    path.unlink(missing_ok=True)
+            except BaseException as exc:
+                errors.append(str(exc))
+        if errors:
+            print('[CRITICAL] Ошибки отката метаданных: ' + '; '.join(errors), file=sys.stderr)
+        else:
+            print('[ROLLBACK OK] Предыдущее состояние метаданных восстановлено.', file=sys.stderr)
+        raise
+    print('[SUCCESS] Метаданные восстановлены: имён {}, назначений групп {}. '
+          'Правила и sysctl не изменялись.'.format(names_count, groups_count))
+
 def import_bundle(args):
     routes, payload = load_bundle(args.bundle)
-    print('[OK] Bundle проверен: {} правил'.format(len(routes)), flush=True)
+    names_count, groups_count = metadata_counts(payload)
+    print('[OK] Bundle проверен: {} правил, имён: {}, назначений групп: {}'.format(
+        len(routes), names_count, groups_count), flush=True)
     if args.dry_run:
         for r in routes:
             print('{} {} -> {}:{}'.format(r['proto'], r['in_port'], r['ip'], r['out_port']))
@@ -2005,7 +2096,9 @@ def import_bundle(args):
         atomic_write(PERSIST, after.encode())
         run('iptables-restore', '-w', '10', '--test', input=PERSIST.read_text())
         run('systemctl', 'enable', 'netfilter-persistent.service')
+        verify_metadata(payload)
         print('[SUCCESS] Импорт завершён; правила сохранены для загрузки через netfilter-persistent.')
+        print('[OK] Записано и проверено: имён {}, назначений групп {}.'.format(names_count, groups_count))
         print('Проверьте реальный трафик через новый hop, затем добавьте его в standby на ingress.')
     except BaseException:
         # Prevent a second Ctrl-C/SIGTERM from aborting rollback.
@@ -2029,6 +2122,9 @@ def main():
     imp.add_argument('bundle')
     imp.add_argument('--dry-run', action='store_true')
     imp.add_argument('--no-install-deps', action='store_true')
+    meta = sub.add_parser('import-metadata', help='Восстановить имена и группы для существующих маршрутов')
+    meta.add_argument('bundle')
+    meta.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     def interrupted(signum, frame):
         raise InterruptedError('Получен сигнал ' + str(signum))
@@ -2038,6 +2134,8 @@ def main():
     try:
         if args.command == 'export-config':
             export_bundle(args.bundle)
+        elif args.command == 'import-metadata':
+            import_metadata(args)
         else:
             import_bundle(args)
     except (Exception, KeyboardInterrupt) as exc:
@@ -2085,7 +2183,7 @@ check_root
 # prepare_system/show_promo/menu и поэтому не может зависнуть на вводе.
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        export-config|import-config)
+        export-config|import-config|import-metadata)
             bundle_cli "$@"
             exit $?
             ;;
