@@ -1664,10 +1664,18 @@ def parse_source(snapshot):
     return validate_routes(routes), comments
 
 def snapshot():
-    # Instantiate these tables before taking a complete, rollback-capable snapshot.
-    run('iptables', '-w', '10', '-t', 'nat', '-S')
-    run('iptables', '-w', '10', '-t', 'filter', '-S')
-    return run('iptables-save')
+    # iptables-nft -S does NOT instantiate an absent table. A restore of a
+    # snapshot that omits nat would therefore leave newly imported DNAT behind.
+    # Represent absent touched tables explicitly, without changing the host.
+    text = run('iptables-save')
+    tables = {line[1:] for line in text.splitlines() if line.startswith('*')}
+    for table, chains in (('nat', ('PREROUTING', 'INPUT', 'OUTPUT', 'POSTROUTING')),
+                          ('filter', ('INPUT', 'FORWARD', 'OUTPUT'))):
+        if table not in tables:
+            text += '\n*' + table + '\n'
+            text += ''.join(':' + chain + ' ACCEPT [0:0]\n' for chain in chains)
+            text += 'COMMIT\n'
+    return text
 
 def clean_target(text):
     table = ''
@@ -1951,12 +1959,23 @@ def verify_routes(routes):
             '-m', 'state', '--state', 'ESTABLISHED,RELATED', '-j', 'ACCEPT')
 
 def input_output_rules(text):
-    table, result = '', []
+    # Table order in iptables-save can change when nft creates a new table.
+    # An absent built-in ACCEPT chain and a newly created empty ACCEPT chain
+    # are equivalent; rule order WITHIN each existing chain remains significant.
+    table = ''
+    result = {(t, c): [':' + c + ' ACCEPT [0:0]']
+              for t in ('*nat', '*filter') for c in ('INPUT', 'OUTPUT')}
     for line in text.splitlines():
         if line.startswith('*'):
             table = line
-        if re.match(r'^(?:-A |:)(?:INPUT|OUTPUT)(?: |$)', line):
-            result.append((table, re.sub(r'\[[0-9]+:[0-9]+\]', '[0:0]', line)))
+        match = re.match(r'^(:|-A )(INPUT|OUTPUT)(?: |$)', line)
+        if match:
+            key = (table, match[2])
+            normalized = re.sub(r'\[[0-9]+:[0-9]+\]', '[0:0]', line)
+            if match[1] == ':':
+                result[key] = [normalized]
+            else:
+                result.setdefault(key, []).append(normalized)
     return result
 
 def metadata_counts(payload):
