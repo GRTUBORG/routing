@@ -1795,10 +1795,35 @@ def atomic_write(path, data):
         if os.path.exists(temp):
             os.unlink(temp)
 
+def check_ufw():
+    # ufw.service is oneshot/RemainAfterExit: systemd may say active (exited)
+    # even after `ufw disable`. Inspect the firewall's own status instead.
+    executable = shutil.which('ufw')
+    if executable:
+        result = subprocess.run([executable, 'status'], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=dict(os.environ, LC_ALL='C', LANG='C'),
+                                timeout=15, check=False)
+        if result.returncode:
+            fail('Не удалось проверить UFW: ' + (result.stderr.strip() or result.stdout.strip()))
+        lines = result.stdout.strip().splitlines()
+        status = lines[0].strip() if lines else ''
+        if status == 'Status: inactive':
+            return
+        if status == 'Status: active':
+            fail('UFW включён (ufw status: active). Импорт требует выключенного UFW.')
+        fail('Неизвестный ответ ufw status; проверьте состояние UFW вручную.')
+    # Missing command is normal when UFW is not installed. An active orphaned
+    # unit is ambiguous, however; do not silently bypass that condition.
+    result = subprocess.run(['systemctl', 'is-active', '--quiet', 'ufw'], check=False)
+    if result.returncode == 0:
+        fail('ufw.service активен, но команда ufw не найдена; состояние firewall не проверено.')
+
 def check_managers():
     if not Path('/run/systemd/system').is_dir():
         fail('Автоимпорт поддерживает Debian/Ubuntu с systemd')
-    for service in ('ufw', 'firewalld', 'docker', 'nftables', 'hop-watchdog'):
+    check_ufw()
+    for service in ('firewalld', 'docker', 'nftables', 'hop-watchdog'):
         p = subprocess.run(['systemctl', 'is-active', '--quiet', service], check=False)
         if p.returncode == 0:
             fail('Сначала остановите конфликтующий сервис: ' + service)
